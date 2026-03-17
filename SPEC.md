@@ -50,6 +50,8 @@ Because this is a hackathon simulation, the architecture consists of three local
 │  - Live Dashboard / Heatmap                  │
 └──────────────────────────────────────────────┘
 
+```
+
 ## 4. Feature Specification
 
 ### 4.1 Real-Time Tool & Drone Discovery
