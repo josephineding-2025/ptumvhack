@@ -13,6 +13,7 @@ class ToolClient(Protocol):
     def move_to(self, drone_id: str, x: int, y: int) -> dict: ...
     def get_battery_status(self, drone_id: str) -> dict: ...
     def thermal_scan(self, drone_id: str) -> dict: ...
+    def get_mission_status(self) -> dict: ...
 
 
 @dataclass
@@ -33,6 +34,9 @@ class LocalToolClient:
 
     def thermal_scan(self, drone_id: str) -> dict:
         return tools.thermal_scan(drone_id)
+
+    def get_mission_status(self) -> dict:
+        return tools.get_mission_status()
 
 
 class SwarmOrchestrator:
@@ -56,52 +60,65 @@ class SwarmOrchestrator:
             assignments.append((drone_id, waypoints[idx % len(waypoints)]))
         return assignments
 
-    def run_startup_mission(self) -> dict[str, Any]:
-        self._log_thinking(
-            "Discover all active drones first, then assign nearest unscanned waypoints while keeping battery above recall threshold."
-        )
-        fleet = self.tools.list_drones()
-        self._record_action("list_drones", fleet)
+    def run_continuous_mission(self, iterations: int = 20) -> dict[str, Any]:
+        import time
 
-        if not fleet.get("ok"):
-            return {
-                "system_prompt": SYSTEM_PROMPT,
-                "startup_prompt": MISSION_START_PROMPT,
-                "log": self.mission_log,
-                "status": "startup_failed",
-                "error": fleet.get("error"),
-            }
-
-        online_ids = [d["id"] for d in fleet["data"]["drones"]]
-        assignments = self._assign_waypoints(online_ids)
-        for drone_id, waypoint in assignments:
-            battery = self.tools.get_battery_status(drone_id)
-            self._record_action("get_battery_status", battery)
-            if not battery.get("ok"):
-                continue
-            if battery["data"]["battery"] <= self.config.low_battery_threshold:
-                self._log_thinking(
-                    f"Drone {drone_id} is at {battery['data']['battery']}%. Recall to base to avoid mid-sector failure."
-                )
-                move_result = self.tools.move_to(drone_id, 0, 0)
-                self._record_action("move_to", move_result)
+        self._log_thinking("Starting continuous Search and Rescue mission loop.")
+        
+        for i in range(iterations):
+            # 1. Discover Fleet
+            fleet = self.tools.list_drones()
+            if not fleet.get("ok"):
+                break
+            
+            online_drones = fleet["data"]["drones"]
+            if not online_drones:
+                self._log_thinking("No online drones available. Waiting...")
+                time.sleep(2)
                 continue
 
-            self._log_thinking(
-                f"Drone {drone_id} has sufficient battery ({battery['data']['battery']}%). Move to sector waypoint {waypoint}."
-            )
-            move_result = self.tools.move_to(drone_id, waypoint[0], waypoint[1])
-            self._record_action("move_to", move_result)
+            # 2. Check Mission Progress
+            stats = self.tools.get_mission_status()
+            if stats.get("ok"):
+                coverage = stats["data"]["coverage_ratio"]
+                self._log_thinking(f"Iteration {i+1}/{iterations}. Current Coverage: {coverage*100:.1f}%.")
+                if coverage >= 0.95:
+                    self._log_thinking("Mission Objective Achieved: High coverage reached.")
+                    break
 
-            self._log_thinking(f"Drone {drone_id} arrived at {waypoint}; execute thermal scan for survivor signal.")
-            scan_result = self.tools.thermal_scan(drone_id)
-            self._record_action("thermal_scan", scan_result)
+            # 3. Process Each Drone
+            for drone in online_drones:
+                drone_id = drone["id"]
+                battery = drone["battery"]
+                current_loc = drone["location"]
+
+                # Battery Recall Logic
+                if battery <= self.config.low_battery_threshold:
+                    if current_loc != [0, 0]:
+                        self._log_thinking(f"Drone {drone_id} battery low ({battery}%). Recalling to base.")
+                        self.tools.move_to(drone_id, 0, 0)
+                    else:
+                        self._log_thinking(f"Drone {drone_id} is charging at base.")
+                    continue
+
+                # Search Logic: Move to a random nearby unscanned waypoint or just cycle through pattern
+                # For simplicity in this demo, we'll use a spiral/grid pattern based on drone index and time
+                target_x = (int(time.time() * 2) + int(drone_id[-1])) % 20
+                target_y = (int(time.time()) + int(drone_id[-1]) * 3) % 20
+                
+                self._log_thinking(f"Drone {drone_id} ({battery}%): Moving to search sector [{target_x}, {target_y}].")
+                self.tools.move_to(drone_id, target_x, target_y)
+                
+                self._log_thinking(f"Drone {drone_id}: Executing thermal scan at target.")
+                scan_result = self.tools.thermal_scan(drone_id)
+                if "1 thermal signature" in scan_result.get("data", {}).get("message", ""):
+                    self._log_thinking(f"CRITICAL: Drone {drone_id} detected a survivor signature!")
+
+            time.sleep(1)
 
         return {
-            "system_prompt": SYSTEM_PROMPT,
-            "startup_prompt": MISSION_START_PROMPT,
+            "status": "mission_paused_or_completed",
             "log": self.mission_log,
-            "status": "startup_completed",
         }
 
     def handle_user_command(self, command: str) -> dict[str, Any]:
@@ -116,11 +133,24 @@ class SwarmOrchestrator:
 
 
 def main() -> None:
+    import threading
+    from sim.pygame_renderer import PygameRenderer
+    from server.fastmcp_bridge import env
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     orchestrator = SwarmOrchestrator()
-    result = orchestrator.run_startup_mission()
-    print(result["status"])
-    print(f"log_entries={len(result['log'])}")
+    
+    # Run agent in background so Pygame can take the main thread (required on MacOS)
+    def run_agent():
+        result = orchestrator.run_continuous_mission(iterations=50)
+        print(f"\n[{result['status']}] log_entries={len(result['log'])}")
+
+    agent_thread = threading.Thread(target=run_agent, daemon=True)
+    agent_thread.start()
+
+    # Pygame window blocking call
+    renderer = PygameRenderer(env)
+    renderer.run()
 
 
 if __name__ == "__main__":
