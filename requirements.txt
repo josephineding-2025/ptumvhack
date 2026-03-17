@@ -1,0 +1,8 @@
+langchain
+langgraph
+langchain-openai
+langchain-mcp-adapters
+fastmcp
+pygame
+openai
+python-dotenv
