@@ -27,6 +27,15 @@ class SimulationEnvironment:
     def get_active_fleet(self) -> list[dict]:
         return [d.to_public_dict() for d in self.drones.values() if d.is_online()]
 
+    def get_battery_status(self, drone_id: str) -> dict:
+        drone = self.drones[drone_id]
+        return {
+            "id": drone.drone_id,
+            "battery": drone.battery,
+            "status": drone.status.value,
+            "location": [drone.location[0], drone.location[1]],
+        }
+
     def move_drone(self, drone_id: str, target_x: int, target_y: int) -> str:
         # TODO(Member 2): Replace with stepwise movement + timing model.
         drone = self.drones[drone_id]

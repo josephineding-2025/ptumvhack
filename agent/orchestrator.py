@@ -26,8 +26,8 @@ class SwarmOrchestrator:
     def run_startup_mission(self) -> str:
         # TODO(Member 3): Replace with actual LLM agent invoke call.
         thinking = (
-            "<thinking>Scaffold mode: discover tools, inspect fleet, then assign sectors "
-            "based on distance and battery.</thinking>"
+            "<thinking>Scaffold mode: call list_drones(), evaluate battery and proximity, "
+            "then assign sectors without hard-coded IDs.</thinking>"
         )
         logger.info(thinking)
         return f"{SYSTEM_PROMPT}\n\n{MISSION_START_PROMPT}"

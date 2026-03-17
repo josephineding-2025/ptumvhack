@@ -1,23 +1,30 @@
-# Phase 0 Plan (Shared Foundation)
+# Phase 0 Plan (Case Study 3 Alignment)
 
 ## Objective
-Prepare the repository and environment so each member can start their owned implementation files without blocking others.
+Lock the scaffold to Case Study 3 requirements so implementation starts with the correct MCP tool contract, mission constraints, and deliverable format.
 
 ## Completed
-- Created top-level project modules as placeholders:
-  - `agent/`, `models/`, `server/`, `sim/`, `presentation/`
-- Added foundational repo files:
-  - `.gitignore`
-  - `requirements.txt`
-  - `.env.example`
-  - `tools/setup.ps1`
-- Updated `README.md` with setup and scope boundaries.
+- Core repository scaffold created.
+- `SPEC.md` updated for Case Study 3 mandatory constraints:
+- simulation only
+- MCP-only agent control
+- reasoning log before tool calls
+- runtime drone discovery (no hard-coded IDs)
+- MCP bridge scaffold aligned to case-study tool names:
+- `list_drones`
+- `move_to`
+- `get_battery_status`
+- `thermal_scan`
+- Mission log template aligned to required evidence.
 
 ## Remaining in Phase 0 (Shared)
-- Verify environment creation and dependency install on a machine with usable Python runtime.
-- Lock dependency versions after first successful team integration run.
-- Add CI bootstrap workflow (lint + import smoke test) once member files exist.
+1. Verify local environment creation and dependency installation.
+2. Register MCP tools in `server/fastmcp_bridge.py` and run a local MCP server.
+3. Seed simulation with 3-5 drones and baseline survivor coordinates.
+4. Execute one end-to-end dry run with mission-log output.
+5. Lock dependency versions after the first integration pass.
 
 ## Explicitly Out of Scope in This Step
-- Member 1/2/3/4 implementation tasks from the spec.
-- Feature logic, simulation rendering, MCP tool implementations, and agent orchestration code.
+- Full production agent loop and high-accuracy planning policy.
+- Final UI polish and deck production work.
+- Hardware deployment or physical drone integration.
