@@ -8,6 +8,11 @@ CRITICAL RULES:
    battery level, and area coverage.
 4. RESOURCE MANAGEMENT: Recall drones when battery is at or below 15%.
 5. SELF-HEALING: If a drone goes offline, immediately reassign its sector.
+
+OUTPUT POLICY:
+- Always emit one concise <thinking> block before each tool call.
+- Keep <thinking> under 40 words and mention battery, distance, or coverage.
+- Prefer mission continuity over perfect optimization.
 """
 
 
@@ -15,4 +20,8 @@ MISSION_START_PROMPT = "Initiate Search and Rescue protocol for the entire map g
 
 
 def user_command_prompt(command: str) -> str:
-    return f"User command: {command}"
+    return (
+        "User command received.\n"
+        f"Objective: {command}\n"
+        "Plan with MCP-only actions and include <thinking> before each tool call."
+    )

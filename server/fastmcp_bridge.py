@@ -51,20 +51,38 @@ def get_mission_status() -> dict:
 
 
 def register_tools() -> None:
-    # TODO(Member 1): Decorate/export MCP tools using FastMCP APIs.
-    # Minimum required by case study:
-    # - discovery: list_drones()
-    # - movement: move_to(drone_id, x, y)
-    # - telemetry: get_battery_status(drone_id)
-    # - sensing: thermal_scan(drone_id)
     _ensure_mcp_ready()
+    # Guard against duplicate registration.
+    if getattr(register_tools, "_registered", False):
+        return
+
+    @mcp.tool()
+    def mcp_list_drones() -> list[dict]:
+        return list_drones()
+
+    @mcp.tool()
+    def mcp_move_to(drone_id: str, x: int, y: int) -> str:
+        return move_to(drone_id, x, y)
+
+    @mcp.tool()
+    def mcp_get_battery_status(drone_id: str) -> dict:
+        return get_battery_status(drone_id)
+
+    @mcp.tool()
+    def mcp_thermal_scan(drone_id: str) -> str:
+        return thermal_scan(drone_id)
+
+    @mcp.tool()
+    def mcp_get_mission_status() -> dict:
+        return get_mission_status()
+
+    register_tools._registered = True  # type: ignore[attr-defined]
 
 
 def main() -> None:
-    # TODO(Member 1): register tools and run localhost server.
     _ensure_mcp_ready()
     register_tools()
-    raise NotImplementedError("FastMCP server run loop scaffold only.")
+    mcp.run()
 
 
 if __name__ == "__main__":

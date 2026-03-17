@@ -25,3 +25,17 @@ Copy-Item .env.example .env
 - `move_to(drone_id, x, y)`
 - `get_battery_status(drone_id)`
 - `thermal_scan(drone_id)`
+
+## Quick Start (Scaffold Demo)
+1. Run orchestrator startup mission:
+```powershell
+python -m agent.orchestrator
+```
+2. Run MCP server bridge:
+```powershell
+python -m server.fastmcp_bridge
+```
+3. Optional simulation renderer:
+```powershell
+python -c "from sim.environment import SimulationEnvironment; from sim.pygame_renderer import PygameRenderer; PygameRenderer(SimulationEnvironment()).run()"
+```

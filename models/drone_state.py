@@ -25,6 +25,14 @@ class DroneState:
     def is_online(self) -> bool:
         return self.status != DroneStatus.OFFLINE
 
+    def is_recall_required(self, threshold: int = 15) -> bool:
+        return self.battery <= threshold
+
+    def apply_activity_status(self, recall_threshold: int = 15) -> None:
+        if self.status == DroneStatus.OFFLINE:
+            return
+        self.status = DroneStatus.CHARGING if self.is_recall_required(recall_threshold) else DroneStatus.SEARCHING
+
     def to_public_dict(self) -> dict:
         return {
             "id": self.drone_id,
