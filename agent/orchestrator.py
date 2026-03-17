@@ -9,10 +9,10 @@ logger = logging.getLogger("aegis.orchestrator")
 
 
 class ToolClient(Protocol):
-    def list_drones(self) -> list[dict]: ...
-    def move_to(self, drone_id: str, x: int, y: int) -> str: ...
+    def list_drones(self) -> dict: ...
+    def move_to(self, drone_id: str, x: int, y: int) -> dict: ...
     def get_battery_status(self, drone_id: str) -> dict: ...
-    def thermal_scan(self, drone_id: str) -> str: ...
+    def thermal_scan(self, drone_id: str) -> dict: ...
 
 
 @dataclass
@@ -22,16 +22,16 @@ class AgentConfig:
 
 
 class LocalToolClient:
-    def list_drones(self) -> list[dict]:
+    def list_drones(self) -> dict:
         return tools.list_drones()
 
-    def move_to(self, drone_id: str, x: int, y: int) -> str:
+    def move_to(self, drone_id: str, x: int, y: int) -> dict:
         return tools.move_to(drone_id, x, y)
 
     def get_battery_status(self, drone_id: str) -> dict:
         return tools.get_battery_status(drone_id)
 
-    def thermal_scan(self, drone_id: str) -> str:
+    def thermal_scan(self, drone_id: str) -> dict:
         return tools.thermal_scan(drone_id)
 
 
@@ -63,21 +63,32 @@ class SwarmOrchestrator:
         fleet = self.tools.list_drones()
         self._record_action("list_drones", fleet)
 
-        online_ids = [d["id"] for d in fleet]
+        if not fleet.get("ok"):
+            return {
+                "system_prompt": SYSTEM_PROMPT,
+                "startup_prompt": MISSION_START_PROMPT,
+                "log": self.mission_log,
+                "status": "startup_failed",
+                "error": fleet.get("error"),
+            }
+
+        online_ids = [d["id"] for d in fleet["data"]["drones"]]
         assignments = self._assign_waypoints(online_ids)
         for drone_id, waypoint in assignments:
             battery = self.tools.get_battery_status(drone_id)
             self._record_action("get_battery_status", battery)
-            if battery["battery"] <= self.config.low_battery_threshold:
+            if not battery.get("ok"):
+                continue
+            if battery["data"]["battery"] <= self.config.low_battery_threshold:
                 self._log_thinking(
-                    f"Drone {drone_id} is at {battery['battery']}%. Recall to base to avoid mid-sector failure."
+                    f"Drone {drone_id} is at {battery['data']['battery']}%. Recall to base to avoid mid-sector failure."
                 )
                 move_result = self.tools.move_to(drone_id, 0, 0)
                 self._record_action("move_to", move_result)
                 continue
 
             self._log_thinking(
-                f"Drone {drone_id} has sufficient battery ({battery['battery']}%). Move to sector waypoint {waypoint}."
+                f"Drone {drone_id} has sufficient battery ({battery['data']['battery']}%). Move to sector waypoint {waypoint}."
             )
             move_result = self.tools.move_to(drone_id, waypoint[0], waypoint[1])
             self._record_action("move_to", move_result)

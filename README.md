@@ -26,6 +26,11 @@ Copy-Item .env.example .env
 - `get_battery_status(drone_id)`
 - `thermal_scan(drone_id)`
 
+## MCP Tool Return Format (JSON)
+All MCP tools return JSON objects with a consistent envelope:
+- Success: `{"ok": true, "data": ...}`
+- Error: `{"ok": false, "error": {"code": "...", "message": "...", "details": ...}}`
+
 ## Quick Start (Scaffold Demo)
 1. Run orchestrator startup mission:
 ```powershell
