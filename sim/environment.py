@@ -33,6 +33,10 @@ class SimulationEnvironment:
         }
         self.survivors = {(3, 3), (9, 14), (15, 6)}
 
+    @staticmethod
+    def _serialize_points(points: Set[GridPoint]) -> list[list[int]]:
+        return [[x, y] for x, y in sorted(points)]
+
     def _assert_known_drone(self, drone_id: str) -> DroneState:
         if drone_id not in self.drones:
             raise KeyError(f"Unknown drone_id: {drone_id}")
@@ -108,12 +112,18 @@ class SimulationEnvironment:
 
     def get_mission_status(self) -> dict:
         total_cells = self.width * self.height
+        offline_ids = sorted(
+            drone.drone_id for drone in self.drones.values() if drone.status == DroneStatus.OFFLINE
+        )
         return {
             "grid_size": [self.width, self.height],
             "searched_cells": len(self.searched_cells),
+            "searched_positions": self._serialize_points(self.searched_cells),
             "coverage_ratio": len(self.searched_cells) / total_cells if total_cells else 0,
             "survivors_found": len(self.found_survivors),
+            "found_survivor_positions": self._serialize_points(self.found_survivors),
             "active_drones": len(self.get_active_fleet()),
-            "offline_drones": len([d for d in self.drones.values() if d.status == DroneStatus.OFFLINE]),
+            "offline_drones": len(offline_ids),
+            "offline_drone_ids": offline_ids,
             "total_drones": len(self.drones),
         }
