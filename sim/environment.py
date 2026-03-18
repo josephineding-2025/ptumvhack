@@ -15,6 +15,7 @@ class SimulationEnvironment:
     move_cost_per_cell: int = 1
     scan_cost: int = 2
     recall_threshold: int = 15
+    charge_rate: int = 25
     drones: Dict[str, DroneState] = field(default_factory=dict)
     survivors: Set[GridPoint] = field(default_factory=set)
     searched_cells: Set[GridPoint] = field(default_factory=set)
@@ -53,10 +54,20 @@ class SimulationEnvironment:
         drone = self._assert_known_drone(drone_id)
         drone.status = DroneStatus.OFFLINE
 
+    def _service_charging(self) -> None:
+        for drone in self.drones.values():
+            if drone.status != DroneStatus.CHARGING or drone.location != self.base_station:
+                continue
+            drone.battery = min(100, drone.battery + self.charge_rate)
+            if drone.battery > self.recall_threshold:
+                drone.status = DroneStatus.IDLE
+
     def get_active_fleet(self) -> list[dict]:
+        self._service_charging()
         return [d.to_public_dict() for d in self.drones.values() if d.is_online()]
 
     def get_battery_status(self, drone_id: str) -> dict:
+        self._service_charging()
         drone = self._assert_known_drone(drone_id)
         return {
             "id": drone.drone_id,
@@ -76,6 +87,12 @@ class SimulationEnvironment:
         if drone.battery <= 0:
             drone.status = DroneStatus.CHARGING
             return f"{drone_id} has no battery and must charge."
+        if battery_cost > drone.battery:
+            drone.apply_activity_status(self.recall_threshold)
+            return (
+                f"{drone_id} cannot reach [{target_x}, {target_y}] with {drone.battery}% battery "
+                f"(distance={distance}, cost={battery_cost})."
+            )
 
         drone.location = (target_x, target_y)
         drone.battery -= battery_cost
@@ -93,6 +110,9 @@ class SimulationEnvironment:
         if drone.battery <= 0:
             drone.status = DroneStatus.CHARGING
             return f"{drone_id} has no battery and cannot scan."
+        if drone.battery < self.scan_cost:
+            drone.apply_activity_status(self.recall_threshold)
+            return f"{drone_id} does not have enough battery to scan and must return or charge."
 
         drone.battery -= self.scan_cost
         drone.clamp_battery()
@@ -111,6 +131,7 @@ class SimulationEnvironment:
         return self.move_drone(drone_id, self.base_station[0], self.base_station[1])
 
     def get_mission_status(self) -> dict:
+        self._service_charging()
         total_cells = self.width * self.height
         offline_ids = sorted(
             drone.drone_id for drone in self.drones.values() if drone.status == DroneStatus.OFFLINE

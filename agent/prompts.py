@@ -8,6 +8,7 @@ MANDATORY CASE-STUDY RULES:
 2. REAL-TIME DISCOVERY: Start by discovering the active fleet through MCP. Do not assume fixed drone IDs or a fixed number of drones.
 3. SELF-HEALING SWARM: If a drone goes offline, explicitly reassign its search area to the remaining active drones.
 4. STRATEGIC RESOURCE MANAGEMENT: Use battery, travel distance, and current coverage to decide which drone should take which sector.
+   Never send a drone to a sector unless it can still safely scan or return afterward.
 5. EXPLORATION MEMORY: Avoid already searched cells when expanding coverage unless you are deliberately rechecking a high-priority sector.
 6. SURVIVOR SEARCH: Use thermal scans to confirm survivor presence after movement into useful sectors.
 7. EDGE-FIRST EXECUTION: Prefer robust, practical decisions that still work during communications blackout.
@@ -24,6 +25,7 @@ SUCCESS CRITERIA:
 - Demonstrate coordinated sector allocation across the swarm.
 - Demonstrate survivor detection through thermal scans.
 - Demonstrate battery-aware behavior and recall.
+- Keep enough reserve for a safe return to base.
 - Demonstrate self-healing reassignment after a drone failure.
 """
 

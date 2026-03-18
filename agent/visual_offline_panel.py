@@ -318,6 +318,7 @@ async def run_visual_agent(
                     f"Round {round_idx}/{rounds_label}. Current coverage: {coverage*100:.1f}%.\n"
                     f"{objective_line}\n"
                     f"Grid bounds are x=0..{int(grid_size[0]) - 1}, y=0..{int(grid_size[1]) - 1}. Never propose coordinates outside bounds.\n"
+                    "Do not send a drone on a move unless it still has enough battery to scan locally or return safely toward base.\n"
                     "Execute at least one move_to and one thermal_scan if any active drone has battery above 15%.\n"
                     "Use short operational rationale in <thinking>; do not expose long hidden reasoning.\n"
                     "If a drone goes offline, explicitly reassign its sector across the remaining fleet.\n"

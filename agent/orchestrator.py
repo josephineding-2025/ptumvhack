@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable, Protocol
+from typing import Any, Protocol
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
@@ -146,6 +146,23 @@ class SwarmOrchestrator:
         return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
     @staticmethod
+    def _step_toward(current: tuple[int, int], target: tuple[int, int], max_steps: int) -> tuple[int, int]:
+        x, y = current
+        tx, ty = target
+        remaining = max(0, max_steps)
+        while remaining > 0 and (x, y) != (tx, ty):
+            if x < tx:
+                x += 1
+            elif x > tx:
+                x -= 1
+            elif y < ty:
+                y += 1
+            elif y > ty:
+                y -= 1
+            remaining -= 1
+        return (x, y)
+
+    @staticmethod
     def _extract_data(response: dict) -> dict:
         if not response.get("ok"):
             return {}
@@ -175,13 +192,20 @@ class SwarmOrchestrator:
         sector_end: int,
         iteration: int,
         drone_seed: int,
+        battery: int,
     ) -> list[tuple[int, int]]:
         sector_cells: list[tuple[int, int]] = []
         global_cells: list[tuple[int, int]] = []
+        base = (0, 0)
         for x in range(width):
             for y in range(height):
                 point = (x, y)
                 if point in searched or point == current or point in occupied:
+                    continue
+                travel_cost = self._distance(current, point)
+                return_cost = self._distance(point, base)
+                reserve_cost = travel_cost + return_cost + 2
+                if reserve_cost >= battery:
                     continue
                 if sector_start <= x < sector_end:
                     sector_cells.append(point)
@@ -218,6 +242,7 @@ class SwarmOrchestrator:
         width: int,
         height: int,
         iteration: int,
+        battery: int,
     ) -> tuple[int, int] | None:
         ordered_ids = sorted(item["id"] for item in drones)
         drone_index = ordered_ids.index(drone["id"])
@@ -235,10 +260,48 @@ class SwarmOrchestrator:
             sector_end=sector_end,
             iteration=iteration,
             drone_seed=drone_seed,
+            battery=battery,
         )
         if not candidates:
             return None
         return candidates[(iteration + drone_index + drone_seed) % len(candidates)]
+
+    def _try_local_low_battery_scan(
+        self,
+        drone_id: str,
+        current: tuple[int, int],
+        searched: set[tuple[int, int]],
+        battery: int,
+    ) -> bool:
+        if current in searched:
+            return False
+        return_cost = self._distance(current, (0, 0))
+        if battery <= return_cost + 2:
+            return False
+        self._log_thinking(
+            f"Drone {drone_id} is low on battery but still has enough reserve to scan its current sector before returning."
+        )
+        scan_result = self.tools.thermal_scan(drone_id)
+        self._record_action("thermal_scan", scan_result)
+        return True
+
+    def _return_to_base(
+        self,
+        drone_id: str,
+        current: tuple[int, int],
+        battery: int,
+    ) -> None:
+        if current == (0, 0):
+            self._log_thinking(
+                f"Drone {drone_id} is already at base, so it remains charging until it can rejoin the mission."
+            )
+            return
+        next_step = self._step_toward(current, (0, 0), max_steps=max(1, battery))
+        self._log_thinking(
+            f"Drone {drone_id} battery is low, so it is taking the shortest safe step back to base at [{next_step[0]}, {next_step[1]}]."
+        )
+        move_result = self.tools.move_to(drone_id, next_step[0], next_step[1])
+        self._record_action("move_to", move_result)
 
     def run_continuous_mission(self, iterations: int = 20) -> dict[str, Any]:
         self._log_thinking("Blackout mission start. Discovering active fleet first so sector assignments stay MCP-driven.")
@@ -282,16 +345,19 @@ class SwarmOrchestrator:
                 drone_id = drone["id"]
                 battery = drone["battery"]
                 current_loc = drone["location"]
+                current_point = self._point_key(current_loc)
+                distance_to_base = self._distance(current_point, (0, 0))
+                recall_margin = max(self.config.low_battery_threshold, distance_to_base + 2)
 
                 # Battery Recall Logic
-                if battery <= self.config.low_battery_threshold:
-                    if current_loc != [0, 0]:
-                        self._log_thinking(
-                            f"Drone {drone_id} battery is {battery}%, so I am choosing the shortest safe move back to base."
-                        )
-                        self.tools.move_to(drone_id, 0, 0)
-                    else:
-                        self._log_thinking(f"Drone {drone_id} is already at base with low battery, so it remains out of the search wave.")
+                if battery <= recall_margin:
+                    self._try_local_low_battery_scan(
+                        drone_id=drone_id,
+                        current=current_point,
+                        searched=searched,
+                        battery=battery,
+                    )
+                    self._return_to_base(drone_id, current_point, battery)
                     continue
 
                 target = self._select_target(
@@ -301,11 +367,13 @@ class SwarmOrchestrator:
                     width=int(grid_w),
                     height=int(grid_h),
                     iteration=i,
+                    battery=battery,
                 )
                 if target is None:
                     self._log_thinking(
-                        f"Drone {drone_id} has no useful unsearched sector left, so I am preserving battery instead of repeating coverage."
+                        f"Drone {drone_id} has no safe new sector that still leaves return reserve, so it starts heading back to base."
                     )
+                    self._return_to_base(drone_id, current_point, battery)
                     continue
 
                 target_x, target_y = target
