@@ -13,6 +13,8 @@ class PygameRenderer:
         log_provider: Callable[[], list[str]] | None = None,
         status_provider: Callable[[], dict[str, Any]] | None = None,
         fleet_provider: Callable[[], list[dict[str, Any]]] | None = None,
+        command_submitter: Callable[[str], None] | None = None,
+        offline_submitter: Callable[[str], None] | None = None,
         state_lock: Any | None = None,
     ) -> None:
         self.env = env
@@ -21,6 +23,8 @@ class PygameRenderer:
         self.log_provider = log_provider
         self.status_provider = status_provider
         self.fleet_provider = fleet_provider
+        self.command_submitter = command_submitter
+        self.offline_submitter = offline_submitter
         self.state_lock = state_lock
 
     @staticmethod
@@ -49,6 +53,16 @@ class PygameRenderer:
         lines.append(current)
         return lines
 
+    @staticmethod
+    def _extract_thinking(entry: str) -> str | None:
+        start_tag = "<thinking>"
+        end_tag = "</thinking>"
+        start = entry.find(start_tag)
+        end = entry.find(end_tag)
+        if start == -1 or end == -1 or end <= start:
+            return None
+        return entry[start + len(start_tag):end].strip()
+
     def run(self) -> None:
         try:
             import pygame
@@ -63,6 +77,7 @@ class PygameRenderer:
         clock = pygame.time.Clock()
         font = pygame.font.SysFont("consolas", 16)
         small_font = pygame.font.SysFont("consolas", 14)
+        tiny_font = pygame.font.SysFont("consolas", 12)
 
         status_color = {
             "IDLE": (80, 160, 240),
@@ -72,16 +87,42 @@ class PygameRenderer:
         }
 
         running = True
+        input_text = ""
+        last_submitted = ""
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_k and self.fleet_provider is None:
-                    # Demo shortcut: mark the first online drone offline.
-                    with self.state_lock or nullcontext():
-                        fleet = self.env.get_active_fleet()
-                        if fleet:
-                            self.env.set_offline(fleet[0]["id"])
+                if event.type == pygame.KEYDOWN:
+                    # Demo shortcuts: keys 1-4 mark DR-01..DR-04 as offline.
+                    key_to_drone = {
+                        pygame.K_1: "DR-01",
+                        pygame.K_2: "DR-02",
+                        pygame.K_3: "DR-03",
+                        pygame.K_4: "DR-04",
+                    }
+                    drone_id = key_to_drone.get(event.key)
+                    if drone_id:
+                        if self.offline_submitter is not None:
+                            self.offline_submitter(drone_id)
+                        else:
+                            with self.state_lock or nullcontext():
+                                if drone_id in self.env.drones:
+                                    self.env.set_offline(drone_id)
+                if event.type == pygame.KEYDOWN and self.command_submitter is not None:
+                    if event.key == pygame.K_RETURN:
+                        message = input_text.strip()
+                        if message:
+                            self.command_submitter(message)
+                            last_submitted = message
+                            input_text = ""
+                    elif event.key == pygame.K_BACKSPACE:
+                        input_text = input_text[:-1]
+                    elif event.key == pygame.K_ESCAPE:
+                        input_text = ""
+                    else:
+                        if event.unicode and event.unicode.isprintable():
+                            input_text += event.unicode
 
             screen.fill((15, 18, 24))
             for x in range(self.env.width):
@@ -102,15 +143,35 @@ class PygameRenderer:
                     drones = list(self.env.drones.values())
             for drone in drones:
                 if isinstance(drone, dict):
+                    drone_id = str(drone.get("id", "DR-??"))
                     status = str(drone.get("status", "IDLE"))
                     location = drone.get("location", [0, 0])
+                    battery = int(drone.get("battery", 0))
+                    waypoint = drone.get("waypoint")
+                    last_move_tick = drone.get("last_move_tick")
                 else:
+                    drone_id = drone.drone_id
                     status = drone.status.value
                     location = drone.location
+                    battery = int(drone.battery)
+                    waypoint = drone.metadata.get("waypoint")
+                    last_move_tick = drone.metadata.get("last_move_tick")
                 color = status_color.get(status, (220, 220, 220))
                 px = int(location[0]) * self.cell_size + self.cell_size // 2
                 py = int(location[1]) * self.cell_size + self.cell_size // 2
                 pygame.draw.circle(screen, color, (px, py), self.cell_size // 3)
+                wait_target = "--"
+                if isinstance(waypoint, (list, tuple)) and len(waypoint) == 2:
+                    wait_target = f"[{int(waypoint[0])},{int(waypoint[1])}]"
+                tick_label = str(int(last_move_tick)) if isinstance(last_move_tick, int) else "-"
+                label = (
+                    f"{drone_id} {battery}% [{int(location[0])},{int(location[1])}] {status} "
+                    f"wait:{wait_target} tick:{tick_label}"
+                )
+                label_surface = tiny_font.render(label, True, (232, 236, 245))
+                lx = min(px + self.cell_size // 3 + 2, grid_w - 220)
+                ly = max(2, py - self.cell_size // 2)
+                screen.blit(label_surface, (lx, ly))
 
             panel_x = grid_w
             pygame.draw.rect(screen, (21, 24, 32), pygame.Rect(panel_x, 0, self.panel_width, grid_h))
@@ -119,9 +180,9 @@ class PygameRenderer:
             title = font.render("Agent Thinking", True, (230, 236, 245))
             screen.blit(title, (panel_x + 14, 12))
             hint_text = (
-                "Press K: force one drone offline"
+                "Press 1/2/3/4: set DR-01..DR-04 offline"
                 if self.fleet_provider is None
-                else "MCP view: actions/state come from bridge"
+                else "Press 1/2/3/4 to inject drone failure"
             )
             hint = small_font.render(hint_text, True, (150, 160, 180))
             screen.blit(hint, (panel_x + 14, 34))
@@ -144,14 +205,40 @@ class PygameRenderer:
             raw_logs = self._safe_call(self.log_provider, [])
             logs = raw_logs if isinstance(raw_logs, list) else []
             visible_height = grid_h - y - 12
+            input_area_h = 80 if self.command_submitter is not None else 0
+            visible_height -= input_area_h
             max_lines = max(1, visible_height // 18)
             flat_lines: list[str] = []
             for entry in logs[-60:]:
-                for wrapped in self._wrap_text(str(entry), max_chars=46):
+                thinking = self._extract_thinking(str(entry))
+                if thinking is None:
+                    continue
+                for wrapped in self._wrap_text(thinking, max_chars=46):
                     flat_lines.append(wrapped)
             for line in flat_lines[-max_lines:]:
                 screen.blit(small_font.render(line, True, (220, 224, 232)), (panel_x + 14, y))
                 y += 18
+
+            if self.command_submitter is not None:
+                input_top = grid_h - 74
+                pygame.draw.line(
+                    screen,
+                    (55, 60, 74),
+                    (panel_x + 12, input_top - 8),
+                    (panel_x + self.panel_width - 12, input_top - 8),
+                    1,
+                )
+                prompt = small_font.render("Command (Enter to send):", True, (195, 205, 225))
+                screen.blit(prompt, (panel_x + 14, input_top))
+                input_rect = pygame.Rect(panel_x + 14, input_top + 20, self.panel_width - 28, 24)
+                pygame.draw.rect(screen, (12, 14, 20), input_rect)
+                pygame.draw.rect(screen, (80, 90, 112), input_rect, 1)
+                shown = input_text[-52:] if input_text else ""
+                text_surface = small_font.render(shown, True, (230, 236, 245))
+                screen.blit(text_surface, (input_rect.x + 6, input_rect.y + 4))
+                if last_submitted:
+                    last_line = f"Last: {last_submitted}"
+                    screen.blit(small_font.render(last_line[-52:], True, (150, 160, 180)), (panel_x + 14, input_top + 48))
 
             pygame.display.flip()
             clock.tick(30)

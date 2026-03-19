@@ -41,7 +41,7 @@ def list_drones() -> dict:
 
 
 def move_to(drone_id: str, x: int, y: int) -> dict:
-    """Required MCP tool: move_to(drone_id, x, y). Always returns JSON."""
+    """Required MCP tool: move_to(drone_id, x, y). Assigns waypoint; edge agent executes path."""
     try:
         message = env.move_drone(drone_id, x, y)
         status = env.get_battery_status(drone_id)
@@ -84,6 +84,17 @@ def get_mission_status() -> dict:
         return _err("internal_error", "Failed to get mission status.", details={"exception": type(e).__name__})
 
 
+def set_drone_offline(drone_id: str) -> dict:
+    """Optional MCP tool: set_drone_offline(drone_id) for simulation fault injection."""
+    try:
+        env.set_offline(drone_id)
+        return _ok({"message": f"{drone_id} set to OFFLINE", "drone_id": drone_id})
+    except KeyError as e:
+        return _err("unknown_drone", str(e))
+    except Exception as e:  # pragma: no cover
+        return _err("internal_error", "Failed to set drone offline.", details={"exception": type(e).__name__})
+
+
 def register_tools() -> None:
     _ensure_mcp_ready()
     # Guard against duplicate registration.
@@ -110,6 +121,10 @@ def register_tools() -> None:
     @mcp.tool()
     def get_mission_status() -> dict:  # type: ignore[no-redef]
         return globals()["get_mission_status"]()
+
+    @mcp.tool()
+    def set_drone_offline(drone_id: str) -> dict:  # type: ignore[no-redef]
+        return globals()["set_drone_offline"](drone_id)
 
     register_tools._registered = True  # type: ignore[attr-defined]
 

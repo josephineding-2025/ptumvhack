@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import os
+import re
 import socket
 import sys
 import threading
@@ -52,6 +53,8 @@ class VisualConfig:
 @dataclass
 class VisualState:
     logs: deque[str] = field(default_factory=lambda: deque(maxlen=240))
+    pending_commands: deque[str] = field(default_factory=deque)
+    pending_offline_ids: deque[str] = field(default_factory=deque)
     lock: threading.RLock = field(default_factory=threading.RLock)
     done: bool = False
 
@@ -59,9 +62,34 @@ class VisualState:
         with self.lock:
             self.logs.append(message)
 
+    def push_command(self, command: str) -> None:
+        text = command.strip()
+        if not text:
+            return
+        with self.lock:
+            self.pending_commands.append(text)
+            self.logs.append(f"[user] {text}")
+
     def get_logs(self) -> list[str]:
         with self.lock:
             return list(self.logs)
+
+    def pop_command(self) -> str | None:
+        with self.lock:
+            if not self.pending_commands:
+                return None
+            return self.pending_commands.popleft()
+
+    def push_offline(self, drone_id: str) -> None:
+        with self.lock:
+            self.pending_offline_ids.append(drone_id)
+            self.logs.append(f"[user] fail {drone_id}")
+
+    def pop_offline(self) -> str | None:
+        with self.lock:
+            if not self.pending_offline_ids:
+                return None
+            return self.pending_offline_ids.popleft()
 
     def mark_done(self) -> None:
         with self.lock:
@@ -78,6 +106,8 @@ class VisualSnapshot:
             "coverage_ratio": 0.0,
             "searched_cells": 0,
             "survivors_found": 0,
+            "total_survivors": 0,
+            "all_survivors_found": False,
             "active_drones": 0,
             "total_drones": 0,
         }
@@ -144,11 +174,49 @@ def _normalize_tool_response(raw: Any) -> dict[str, Any]:
     raise RuntimeError(f"Unexpected MCP response format: {type(raw).__name__}")
 
 
+def _is_objective_met(command: str, mission_status: dict[str, Any]) -> bool:
+    objective = command.strip().lower()
+    if not objective:
+        return False
+    coverage = float(mission_status.get("coverage_ratio", 0.0))
+    all_survivors_found = bool(mission_status.get("all_survivors_found", False))
+
+    percentage_match = re.search(r"(\d{1,3})\s*%", objective)
+    if percentage_match:
+        target = max(0, min(100, int(percentage_match.group(1)))) / 100.0
+        if coverage >= target:
+            return True
+
+    if "entire grid" in objective or "full grid" in objective or "100%" in objective:
+        return coverage >= 1.0
+    if "all survivors" in objective or "every survivor" in objective:
+        return all_survivors_found
+    if "survivor" in objective and "report" in objective:
+        return int(mission_status.get("survivors_found", 0)) > 0
+    return False
+
+
 async def _refresh_snapshot(tool_map: dict[str, Any], snapshot: VisualSnapshot) -> None:
     fleet_response = _normalize_tool_response(await tool_map["list_drones"].ainvoke({}))
     mission_response = _normalize_tool_response(await tool_map["get_mission_status"].ainvoke({}))
-    drones = fleet_response.get("data", {}).get("drones", []) if fleet_response.get("ok") else []
+    live_drones = fleet_response.get("data", {}).get("drones", []) if fleet_response.get("ok") else []
     mission_status = mission_response.get("data", {}) if mission_response.get("ok") else {}
+    offline_ids = {str(did) for did in mission_status.get("offline_drone_ids", [])}
+
+    previous = {str(item.get("id", "")): dict(item) for item in snapshot.get_drones() if item.get("id")}
+    merged: dict[str, dict[str, Any]] = {}
+    for drone in live_drones:
+        drone_id = str(drone.get("id", ""))
+        if not drone_id:
+            continue
+        merged[drone_id] = dict(drone)
+    for drone_id in offline_ids:
+        prior = dict(previous.get(drone_id, {"id": drone_id, "location": [0, 0], "battery": 0}))
+        prior["status"] = "OFFLINE"
+        merged[drone_id] = prior
+
+    # Preserve deterministic ordering by drone id for stable rendering/assignment.
+    drones = [merged[key] for key in sorted(merged.keys())]
     snapshot.update(drones=drones, mission_status=mission_status)
 
 
@@ -211,6 +279,17 @@ async def run_visual_agent(
             loaded_tools = await load_mcp_tools(session, server_name="aegis_swarm")
             tool_map = {loaded_tool.name: loaded_tool for loaded_tool in loaded_tools}
             await _refresh_snapshot(tool_map, snapshot)
+            assigned_waypoints: dict[str, tuple[int, int]] = {}
+            round_stats: dict[str, int] = {"move_calls": 0, "status_calls": 0}
+
+            def _location_for(drone_id: str) -> tuple[int, int] | None:
+                for item in snapshot.get_drones():
+                    if str(item.get("id", "")) != drone_id:
+                        continue
+                    loc = item.get("location", [0, 0])
+                    if isinstance(loc, list) and len(loc) == 2:
+                        return int(loc[0]), int(loc[1])
+                return None
 
             @tool
             async def list_drones() -> dict:
@@ -227,19 +306,46 @@ async def run_visual_agent(
             @tool
             async def move_to(drone_id: str, x: int, y: int) -> dict:
                 """Move a drone to target coordinates on the grid."""
+                target = (int(x), int(y))
+                current_loc = _location_for(drone_id)
+                existing = assigned_waypoints.get(drone_id)
+                if existing is not None and current_loc is not None and current_loc != existing:
+                    status = _normalize_tool_response(
+                        await tool_map["get_battery_status"].ainvoke({"drone_id": drone_id})
+                    )
+                    await _refresh_snapshot(tool_map, snapshot)
+                    return {
+                        "ok": True,
+                        "data": {
+                            "message": (
+                                f"{drone_id} already en route to waypoint [{existing[0]}, {existing[1]}]. "
+                                "Central command waits until arrival."
+                            ),
+                            "battery_status": status.get("data", {}),
+                        },
+                    }
+
                 ui.push(
-                    f"<thinking>{drone_id} has enough battery and this move expands coverage, so I am sending it to [{int(x)},{int(y)}].</thinking>"
+                    f"<thinking>{drone_id} is being assigned strategic waypoint [{target[0]},{target[1]}], while edge pathing handles local movement and collision avoidance.</thinking>"
                 )
                 result = _normalize_tool_response(
-                    await tool_map["move_to"].ainvoke({"drone_id": drone_id, "x": int(x), "y": int(y)})
+                    await tool_map["move_to"].ainvoke({"drone_id": drone_id, "x": target[0], "y": target[1]})
                 )
+                round_stats["move_calls"] += 1
                 await _refresh_snapshot(tool_map, snapshot)
                 if result.get("ok"):
                     battery = result.get("data", {}).get("battery_status", {}).get("battery", "?")
-                    ui.push(f"[tool] move_to({drone_id},{int(x)},{int(y)}) -> {battery}%")
+                    message = str(result.get("data", {}).get("message", "")).lower()
+                    loc = result.get("data", {}).get("battery_status", {}).get("location", [0, 0])
+                    accepted = ("accepted waypoint" in message) or ("already executing waypoint" in message)
+                    if accepted and isinstance(loc, list) and len(loc) == 2 and (int(loc[0]), int(loc[1])) != target:
+                        assigned_waypoints[drone_id] = target
+                    else:
+                        assigned_waypoints.pop(drone_id, None)
+                    ui.push(f"[tool] move_to({drone_id},{target[0]},{target[1]}) -> {battery}%")
                 else:
                     error = result.get("error", {}).get("message", "unknown error")
-                    ui.push(f"[tool:error] move_to({drone_id},{int(x)},{int(y)}) -> {error}")
+                    ui.push(f"[tool:error] move_to({drone_id},{target[0]},{target[1]}) -> {error}")
                 return result
 
             @tool
@@ -250,6 +356,12 @@ async def run_visual_agent(
                 )
                 result = _normalize_tool_response(await tool_map["thermal_scan"].ainvoke({"drone_id": drone_id}))
                 await _refresh_snapshot(tool_map, snapshot)
+                if result.get("ok") and result.get("data", {}).get("detected"):
+                    loc = result.get("data", {}).get("battery_status", {}).get("location", [0, 0])
+                    if isinstance(loc, list) and len(loc) == 2:
+                        ui.push(
+                            f"<thinking>Survivor detected at exact coordinates [{int(loc[0])}, {int(loc[1])}]. Continuing mission search.</thinking>"
+                        )
                 message = result.get("data", {}).get("message", "") if result.get("ok") else result.get("error", {}).get(
                     "message", "unknown error"
                 )
@@ -282,6 +394,7 @@ async def run_visual_agent(
                     "<thinking>I need mission coverage and fleet status before reallocating sectors or continuing the sweep.</thinking>"
                 )
                 result = _normalize_tool_response(await tool_map["get_mission_status"].ainvoke({}))
+                round_stats["status_calls"] += 1
                 await _refresh_snapshot(tool_map, snapshot)
                 if result.get("ok"):
                     coverage = float(result.get("data", {}).get("coverage_ratio", 0.0)) * 100
@@ -291,53 +404,295 @@ async def run_visual_agent(
                     ui.push(f"[tool:error] get_mission_status -> {error}")
                 return result
 
-            agent = create_agent(
-                model=llm,
-                tools=[list_drones, move_to, get_battery_status, thermal_scan, get_mission_status],
-                system_prompt=SYSTEM_PROMPT,
-            )
-
             round_idx = 1
+            active_command = command.strip()
+            if not active_command:
+                ui.push("[agent] waiting for user command in chatbox (example: search north east area).")
+            no_assignment_backoff_sec = 2.0
+            next_dispatch_time = 0.0
+            last_assigned_target: dict[str, tuple[int, int]] = {}
+
+            async def fallback_assign_waypoints() -> int:
+                # Anti-stall fallback: assign strategic waypoints if LLM round produced no movement.
+                fleet_response = _normalize_tool_response(await tool_map["list_drones"].ainvoke({}))
+                mission_response = _normalize_tool_response(await tool_map["get_mission_status"].ainvoke({}))
+                await _refresh_snapshot(tool_map, snapshot)
+                drones = fleet_response.get("data", {}).get("drones", [])
+                mission = mission_response.get("data", {})
+                grid = mission.get("grid_size", [20, 20])
+                width, height = int(grid[0]), int(grid[1])
+                searched = {
+                    (int(p[0]), int(p[1]))
+                    for p in mission.get("searched_positions", [])
+                    if isinstance(p, (list, tuple)) and len(p) == 2
+                }
+                if not drones:
+                    return 0
+
+                objective = active_command.lower()
+                base = (0, 0)
+                ordered_ids = sorted(
+                    str(d.get("id", ""))
+                    for d in drones
+                    if d.get("id") and str(d.get("status", "")) != "OFFLINE"
+                )
+                if not ordered_ids:
+                    return 0
+
+                def objective_allows(x: int, y: int) -> bool:
+                    if "east" in objective and x < width // 2:
+                        return False
+                    if "west" in objective and x >= width // 2:
+                        return False
+                    if "north" in objective and y >= height // 2:
+                        return False
+                    if "south" in objective and y < height // 2:
+                        return False
+                    return True
+
+                def build_wavefront_anchors(total: int, frontier_radius: int) -> list[tuple[int, int]]:
+                    radius = max(0, min(frontier_radius, (width - 1) + (height - 1)))
+                    x_min = max(0, radius - (height - 1))
+                    x_max = min(width - 1, radius)
+                    while x_min > x_max and radius > 0:
+                        radius -= 1
+                        x_min = max(0, radius - (height - 1))
+                        x_max = min(width - 1, radius)
+                    if total <= 0:
+                        return []
+                    available_x = list(range(x_min, x_max + 1))
+                    if not available_x:
+                        return [(0, 0)] * total
+                    chosen_x: list[int] = []
+                    used_x: set[int] = set()
+                    for idx in range(total):
+                        raw_x = x_min if total == 1 else x_min + round((x_max - x_min) * idx / (total - 1))
+                        best_x = min(
+                            available_x,
+                            key=lambda value: (value in used_x, abs(value - raw_x), value),
+                        )
+                        chosen_x.append(best_x)
+                        used_x.add(best_x)
+                    return [(x, radius - x) for x in chosen_x]
+
+                searched_frontier = max((x + y for x, y in searched), default=0)
+                wavefront_radius = min((width - 1) + (height - 1), max(4, searched_frontier + 2))
+                wavefront_anchors = build_wavefront_anchors(len(ordered_ids), wavefront_radius)
+                anchor_by_drone = {
+                    drone_id: wavefront_anchors[idx]
+                    for idx, drone_id in enumerate(ordered_ids)
+                }
+
+                assignment_lines: list[str] = []
+                used_targets: set[tuple[int, int]] = set()
+                for drone_id in ordered_ids:
+                    drone = next((item for item in drones if str(item.get("id", "")) == drone_id), None)
+                    if drone is None:
+                        continue
+                    if not drone_id:
+                        continue
+                    loc = drone.get("location", [0, 0])
+                    if not isinstance(loc, list) or len(loc) != 2:
+                        continue
+                    current = (int(loc[0]), int(loc[1]))
+                    status = str(drone.get("status", ""))
+                    if status == "OFFLINE":
+                        continue
+                    existing = assigned_waypoints.get(drone_id)
+                    if existing is not None and current != existing:
+                        continue
+                    battery = int(drone.get("battery", 0))
+                    preferred_anchor = anchor_by_drone.get(drone_id, base)
+
+                    candidates: list[tuple[int, int]] = []
+                    min_assignment_distance = 3
+                    for x in range(width):
+                        for y in range(height):
+                            point = (x, y)
+                            if point in searched or point in used_targets or point == current:
+                                continue
+                            if not objective_allows(x, y):
+                                continue
+                            # Keep a strict return reserve.
+                            travel = abs(current[0] - x) + abs(current[1] - y)
+                            ret = abs(x - base[0]) + abs(y - base[1])
+                            # Keep extra reserve margin to avoid oscillation at battery edge.
+                            if battery <= (travel + ret + 2):
+                                continue
+                            # Avoid trivial short hops that create assignment/wait loops.
+                            if travel < min_assignment_distance:
+                                continue
+                            # Avoid repeatedly hugging base unless no other option.
+                            if abs(x - base[0]) + abs(y - base[1]) <= 2:
+                                continue
+                            candidates.append(point)
+                    if not candidates:
+                        # Fallback to any unsearched safe point.
+                        for x in range(width):
+                            for y in range(height):
+                                point = (x, y)
+                                if point in searched or point in used_targets or point == current:
+                                    continue
+                                travel = abs(current[0] - x) + abs(current[1] - y)
+                                ret = abs(x - base[0]) + abs(y - base[1])
+                                if battery <= (travel + ret + 2):
+                                    continue
+                                candidates.append(point)
+                    if not candidates:
+                        # No safe exploration target: recall once for recharge if not already at base.
+                        if current != base:
+                            move_result = _normalize_tool_response(
+                                await tool_map["move_to"].ainvoke({"drone_id": drone_id, "x": base[0], "y": base[1]})
+                            )
+                            message = str(move_result.get("data", {}).get("message", "")).lower()
+                            accepted = move_result.get("ok") and ("accepted waypoint" in message or "already executing waypoint" in message)
+                            if accepted:
+                                assigned_waypoints[drone_id] = base
+                                assignment_lines.append(f"{drone_id}->[0,0]")
+                        continue
+                    # Keep the swarm on a balanced diagonal wavefront so coverage expands as one search front.
+                    previous_target = last_assigned_target.get(drone_id)
+                    candidates.sort(key=lambda p: (
+                        abs(preferred_anchor[0] - p[0]) + abs(preferred_anchor[1] - p[1]),
+                        -(abs(p[0] - base[0]) + abs(p[1] - base[1])),
+                        abs(current[0] - p[0]) + abs(current[1] - p[1]),
+                        p[0],
+                        p[1],
+                    ))
+                    target = candidates[0]
+                    if previous_target is not None and target == previous_target and len(candidates) > 1:
+                        target = candidates[1]
+                    move_result = _normalize_tool_response(
+                        await tool_map["move_to"].ainvoke({"drone_id": drone_id, "x": target[0], "y": target[1]})
+                    )
+                    message = str(move_result.get("data", {}).get("message", "")).lower()
+                    accepted = move_result.get("ok") and ("accepted waypoint" in message or "already executing waypoint" in message)
+                    if accepted:
+                        assigned_waypoints[drone_id] = target
+                        last_assigned_target[drone_id] = target
+                        used_targets.add(target)
+                        assignment_lines.append(f"{drone_id}->[{target[0]},{target[1]}]")
+                await _refresh_snapshot(tool_map, snapshot)
+                if assignment_lines:
+                    ui.push("<thinking>Issuing a balanced diagonal wavefront so the swarm expands coverage as one coordinated search shape.</thinking>")
+                    ui.push(f"<thinking>Assigned waypoints: {', '.join(assignment_lines)}</thinking>")
+                return len(assignment_lines)
+
+            async def wait_until_waypoints_reached(max_wait_sec: float = 120.0) -> None:
+                if not assigned_waypoints:
+                    return
+                ui.push("<thinking>Waiting for edge drones to autonomously reach assigned waypoints before the next planning round.</thinking>")
+                start = asyncio.get_running_loop().time()
+                last_snapshot: dict[str, tuple[int, int]] = {}
+                stagnant_cycles = 0
+                while assigned_waypoints:
+                    await _refresh_snapshot(tool_map, snapshot)
+                    fleet_now = snapshot.get_drones()
+                    current_snapshot: dict[str, tuple[int, int]] = {}
+                    fleet_ids = {str(d.get("id", "")) for d in fleet_now}
+                    for drone_id in list(assigned_waypoints.keys()):
+                        if drone_id not in fleet_ids:
+                            assigned_waypoints.pop(drone_id, None)
+                    for drone in fleet_now:
+                        drone_id = str(drone.get("id", ""))
+                        if drone_id not in assigned_waypoints:
+                            continue
+                        status = str(drone.get("status", ""))
+                        loc = drone.get("location", [0, 0])
+                        if status == "OFFLINE":
+                            assigned_waypoints.pop(drone_id, None)
+                            continue
+                        if isinstance(loc, list) and len(loc) == 2:
+                            current = (int(loc[0]), int(loc[1]))
+                            current_snapshot[drone_id] = current
+                            if current == (0, 0) and status in {"CHARGING", "IDLE"}:
+                                assigned_waypoints.pop(drone_id, None)
+                                continue
+                            if current == assigned_waypoints[drone_id]:
+                                assigned_waypoints.pop(drone_id, None)
+                    if not assigned_waypoints:
+                        break
+                    stagnant_drones: list[str] = []
+                    for drone_id, pos in current_snapshot.items():
+                        if last_snapshot.get(drone_id) == pos:
+                            stagnant_drones.append(drone_id)
+                    if stagnant_drones and len(stagnant_drones) == len(current_snapshot):
+                        stagnant_cycles += 1
+                    else:
+                        stagnant_cycles = 0
+                    last_snapshot = current_snapshot
+                    if stagnant_cycles >= 12:
+                        # Fail-safe: clear only stuck drones and continue wave progression.
+                        for drone_id in list(current_snapshot.keys()):
+                            assigned_waypoints.pop(drone_id, None)
+                        ui.push("[warn] autonomous waypoint progress stalled for current wave; clearing stuck waypoint waits and continuing.")
+                        break
+                    if asyncio.get_running_loop().time() - start >= max_wait_sec:
+                        ui.push("[warn] waypoint wait timeout reached; continuing with next planning round.")
+                        break
+                    await asyncio.sleep(0.15)
+
             while True:
                 if rounds > 0 and round_idx > rounds:
                     ui.push(f"[agent] Reached configured round limit ({rounds}).")
                     break
+                queued_command = ui.pop_command()
+                if queued_command:
+                    active_command = queued_command
+                    ui.push(f"[agent] objective accepted: {active_command}")
+                queued_offline = ui.pop_offline()
+                while queued_offline:
+                    offline_tool = tool_map.get("set_drone_offline")
+                    if offline_tool is None:
+                        ui.push("[warn] set_drone_offline MCP tool unavailable; restart bridge after pulling latest code.")
+                        break
+                    offline_result = _normalize_tool_response(await offline_tool.ainvoke({"drone_id": queued_offline}))
+                    status_msg = offline_result.get("data", {}).get("message", "")
+                    ui.push(f"[tool] set_drone_offline({queued_offline}) -> {status_msg or 'ok'}")
+                    await _refresh_snapshot(tool_map, snapshot)
+                    queued_offline = ui.pop_offline()
+
+                # Drop completed waypoint tracking for drones that arrived.
+                fleet_now = snapshot.get_drones()
+                for drone in fleet_now:
+                    drone_id = str(drone.get("id", ""))
+                    loc = drone.get("location", [0, 0])
+                    if drone_id not in assigned_waypoints:
+                        continue
+                    if isinstance(loc, list) and len(loc) == 2:
+                        if (int(loc[0]), int(loc[1])) == assigned_waypoints[drone_id]:
+                            assigned_waypoints.pop(drone_id, None)
+
+                if not active_command:
+                    await asyncio.sleep(0.2)
+                    continue
 
                 mission_status = snapshot.get_status()
                 coverage = float(mission_status.get("coverage_ratio", 0.0))
-                grid_size = mission_status.get("grid_size", [20, 20])
-                if coverage >= 0.95:
-                    objective_line = "Coverage target achieved; continue patrol sweeps and monitor battery while staying in-bounds."
-                else:
-                    objective_line = "Expand coverage with coordinated moves and thermal scans."
-
-                rounds_label = str(rounds) if rounds > 0 else "continuous"
-                mission_prompt = (
-                    f"{MISSION_START_PROMPT}\n\n"
-                    f"{user_command_prompt(command)}\n"
-                    f"Round {round_idx}/{rounds_label}. Current coverage: {coverage*100:.1f}%.\n"
-                    f"{objective_line}\n"
-                    f"Grid bounds are x=0..{int(grid_size[0]) - 1}, y=0..{int(grid_size[1]) - 1}. Never propose coordinates outside bounds.\n"
-                    "Do not send a drone on a move unless it still has enough battery to scan locally or return safely toward base.\n"
-                    "Execute at least one move_to and one thermal_scan if any active drone has battery above 15%.\n"
-                    "Use short operational rationale in <thinking>; do not expose long hidden reasoning.\n"
-                    "If a drone goes offline, explicitly reassign its sector across the remaining fleet.\n"
-                    "Return a concise action summary."
-                )
-                ui.push(f"[agent] round {round_idx}: planning actions...")
-                try:
-                    result = await asyncio.wait_for(
-                        agent.ainvoke({"messages": [("user", mission_prompt)]}),
-                        timeout=timeout_sec,
+                all_survivors_found = bool(mission_status.get("all_survivors_found", False))
+                full_grid_scanned = coverage >= 1.0
+                objective_met = _is_objective_met(active_command, mission_status)
+                if all_survivors_found or full_grid_scanned or objective_met:
+                    ui.push(
+                        "<thinking>Mission completion condition met. Edge drones are autonomously returning to base under Mesa completion policy.</thinking>"
                     )
-                except asyncio.TimeoutError:
-                    ui.push(f"[warn] planning timed out after {timeout_sec:.0f}s; moving to next round.")
-                    round_idx += 1
-                    continue
-                summary = _extract_agent_text(result).strip().replace("\n", " ")
-                if len(summary) > 220:
-                    summary = summary[:220] + "..."
-                ui.push(f"[agent] {summary}")
+                    ui.push("[agent] MISSION COMPLETE")
+                    break
+
+                # Central wave control: assign waypoints, wait for completion, then reassign next wave.
+                if not assigned_waypoints:
+                    now = asyncio.get_running_loop().time()
+                    if now >= next_dispatch_time:
+                        assigned_count = await fallback_assign_waypoints()
+                        if assigned_count > 0:
+                            ui.push("<thinking>All drones are idle at assigned points. Sending next central waypoint wave now.</thinking>")
+                            next_dispatch_time = now + 0.5
+                        else:
+                            ui.push("<thinking>No safe new waypoints available. Holding until recharge/state change before next dispatch attempt.</thinking>")
+                            next_dispatch_time = now + no_assignment_backoff_sec
+                await wait_until_waypoints_reached(max_wait_sec=45.0)
+                await _refresh_snapshot(tool_map, snapshot)
+                await asyncio.sleep(0.2)
                 round_idx += 1
     except Exception as exc:
         ui.push(f"[error] {type(exc).__name__}: {exc}")
@@ -353,8 +708,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--command",
-        default="Discover active drones, spread out for coverage, scan key sectors, and report findings.",
-        help="Mission command for the local agent.",
+        default="",
+        help="Initial mission command (leave empty to wait for chatbox command).",
     )
     parser.add_argument(
         "--cell-size",
@@ -413,12 +768,20 @@ def main() -> None:
     def fleet_provider() -> list[dict[str, Any]]:
         return snapshot.get_drones()
 
+    def submit_command(text: str) -> None:
+        ui.push_command(text)
+
+    def submit_offline(drone_id: str) -> None:
+        ui.push_offline(drone_id)
+
     renderer = PygameRenderer(
         renderer_env,
         cell_size=args.cell_size,
         log_provider=ui.get_logs,
         status_provider=status_provider,
         fleet_provider=fleet_provider,
+        command_submitter=submit_command,
+        offline_submitter=submit_offline,
         state_lock=snapshot.lock,
     )
     renderer.run()

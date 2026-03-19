@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ class ToolClient(Protocol):
 @dataclass
 class AgentConfig:
     low_battery_threshold: int = 15
+    caution_battery_threshold: int = 30
     scan_after_move: bool = True
 
 
@@ -128,6 +130,7 @@ class SwarmOrchestrator:
         self.tools = tool_client or MCPToolClient()
         self.mission_log: list[dict[str, Any]] = []
         self._known_offline: set[str] = set()
+        self._current_objective: str = ""
 
     def _log_thinking(self, message: str) -> None:
         thinking = f"<thinking>{message}</thinking>"
@@ -193,10 +196,13 @@ class SwarmOrchestrator:
         iteration: int,
         drone_seed: int,
         battery: int,
+        prefer_near_base: bool | None,
     ) -> list[tuple[int, int]]:
         sector_cells: list[tuple[int, int]] = []
         global_cells: list[tuple[int, int]] = []
         base = (0, 0)
+        near_limit = max(3, (width + height) // 6)
+        far_limit = max(near_limit + 1, (width + height) // 3)
         for x in range(width):
             for y in range(height):
                 point = (x, y)
@@ -207,12 +213,31 @@ class SwarmOrchestrator:
                 reserve_cost = travel_cost + return_cost + 2
                 if reserve_cost >= battery:
                     continue
+                base_distance = self._distance(point, base)
+                if prefer_near_base is True and base_distance > near_limit:
+                    continue
+                if prefer_near_base is False and base_distance < far_limit:
+                    continue
                 if sector_start <= x < sector_end:
                     sector_cells.append(point)
                 else:
                     global_cells.append(point)
 
         preferred = sector_cells or global_cells
+        if not preferred and prefer_near_base is not None:
+            return self._build_search_candidates(
+                current=current,
+                searched=searched,
+                occupied=occupied,
+                width=width,
+                height=height,
+                sector_start=sector_start,
+                sector_end=sector_end,
+                iteration=iteration,
+                drone_seed=drone_seed,
+                battery=battery,
+                prefer_near_base=None,
+            )
         if not preferred:
             return []
 
@@ -243,6 +268,7 @@ class SwarmOrchestrator:
         height: int,
         iteration: int,
         battery: int,
+        prefer_near_base: bool | None,
     ) -> tuple[int, int] | None:
         ordered_ids = sorted(item["id"] for item in drones)
         drone_index = ordered_ids.index(drone["id"])
@@ -261,6 +287,7 @@ class SwarmOrchestrator:
             iteration=iteration,
             drone_seed=drone_seed,
             battery=battery,
+            prefer_near_base=prefer_near_base,
         )
         if not candidates:
             return None
@@ -303,8 +330,39 @@ class SwarmOrchestrator:
         move_result = self.tools.move_to(drone_id, next_step[0], next_step[1])
         self._record_action("move_to", move_result)
 
+    def _recall_all_active_drones(self, online_drones: list[dict[str, Any]]) -> None:
+        self._log_thinking("Recalling all active drones to base [0, 0] and finalizing mission state as COMPLETE.")
+        for drone in online_drones:
+            self._return_to_base(
+                drone_id=drone["id"],
+                current=self._point_key(drone["location"]),
+                battery=int(drone["battery"]),
+            )
+
+    def _is_user_objective_met(self, mission_data: dict[str, Any]) -> bool:
+        if not self._current_objective.strip():
+            return False
+        objective = self._current_objective.lower()
+        coverage = float(mission_data.get("coverage_ratio", 0.0))
+        all_survivors_found = bool(mission_data.get("all_survivors_found", False))
+
+        percentage_match = re.search(r"(\d{1,3})\s*%", objective)
+        if percentage_match:
+            target = max(0, min(100, int(percentage_match.group(1)))) / 100.0
+            if coverage >= target:
+                return True
+
+        if "entire grid" in objective or "full grid" in objective or "100%" in objective:
+            return coverage >= 1.0
+        if "all survivors" in objective or "every survivor" in objective:
+            return all_survivors_found
+        if "survivor" in objective and "report" in objective:
+            return int(mission_data.get("survivors_found", 0)) > 0
+        return False
+
     def run_continuous_mission(self, iterations: int = 20) -> dict[str, Any]:
         self._log_thinking("Blackout mission start. Discovering active fleet first so sector assignments stay MCP-driven.")
+        mission_status = "mission_paused_or_completed"
 
         for i in range(iterations):
             # 1. Discover Fleet
@@ -323,12 +381,21 @@ class SwarmOrchestrator:
             mission_data = self._extract_data(stats)
             if stats.get("ok"):
                 coverage = mission_data.get("coverage_ratio", 0.0)
+                survivors_found = int(mission_data.get("survivors_found", 0))
+                total_survivors = int(mission_data.get("total_survivors", 0))
                 self._log_thinking(
                     f"Coverage is {coverage*100:.1f}%, so I will keep expanding into unsearched sectors while preserving battery."
                 )
                 self._announce_new_offline_drones(set(mission_data.get("offline_drone_ids", [])))
-                if coverage >= 0.95:
-                    self._log_thinking("Coverage is above 95%, so the swarm can shift from expansion to patrol and confirmation.")
+                full_grid_scanned = coverage >= 1.0
+                all_survivors_found = total_survivors > 0 and survivors_found >= total_survivors
+                objective_met = self._is_user_objective_met(mission_data)
+                if full_grid_scanned or all_survivors_found or objective_met:
+                    self._log_thinking(
+                        "Mission completion condition met. All active drones will return to base [0, 0], then mission state will be COMPLETE."
+                    )
+                    self._recall_all_active_drones(online_drones)
+                    mission_status = "COMPLETE"
                     break
             else:
                 mission_data = {}
@@ -346,19 +413,25 @@ class SwarmOrchestrator:
                 battery = drone["battery"]
                 current_loc = drone["location"]
                 current_point = self._point_key(current_loc)
-                distance_to_base = self._distance(current_point, (0, 0))
-                recall_margin = max(self.config.low_battery_threshold, distance_to_base + 2)
 
                 # Battery Recall Logic
-                if battery <= recall_margin:
-                    self._try_local_low_battery_scan(
-                        drone_id=drone_id,
-                        current=current_point,
-                        searched=searched,
-                        battery=battery,
+                if battery < self.config.low_battery_threshold:
+                    self._log_thinking(
+                        f"Drone {drone_id} battery dropped below {self.config.low_battery_threshold}%, so it must return to base [0, 0] immediately."
                     )
                     self._return_to_base(drone_id, current_point, battery)
                     continue
+
+                if battery < self.config.caution_battery_threshold:
+                    self._log_thinking(
+                        f"Drone {drone_id} battery is below {self.config.caution_battery_threshold}%, so it will search near base to preserve a safe return path."
+                    )
+                    prefer_near_base: bool | None = True
+                else:
+                    self._log_thinking(
+                        f"Drone {drone_id} battery is above {self.config.caution_battery_threshold}%, so it can take farther sectors from base for wider coverage."
+                    )
+                    prefer_near_base = False
 
                 target = self._select_target(
                     drone=drone,
@@ -368,6 +441,7 @@ class SwarmOrchestrator:
                     height=int(grid_h),
                     iteration=i,
                     battery=battery,
+                    prefer_near_base=prefer_near_base,
                 )
                 if target is None:
                     self._log_thinking(
@@ -396,19 +470,24 @@ class SwarmOrchestrator:
                 )
                 scan_result = self.tools.thermal_scan(drone_id)
                 self._record_action("thermal_scan", scan_result)
-                if "1 thermal signature" in scan_result.get("data", {}).get("message", ""):
+                scan_data = self._extract_data(scan_result)
+                if bool(scan_data.get("detected")):
+                    detected_loc = scan_data.get("battery_status", {}).get("location", [target_x, target_y])
+                    if not isinstance(detected_loc, list) or len(detected_loc) != 2:
+                        detected_loc = [target_x, target_y]
                     self._log_thinking(
-                        f"Drone {drone_id} found a thermal signature, so this sector becomes a confirmed rescue priority."
+                        f"Drone {drone_id} detected a survivor signature at exact coordinates [{int(detected_loc[0])}, {int(detected_loc[1])}] and is continuing the search pattern."
                     )
 
             time.sleep(1)
 
         return {
-            "status": "mission_paused_or_completed",
+            "status": mission_status,
             "log": self.mission_log,
         }
 
     def handle_user_command(self, command: str) -> dict[str, Any]:
+        self._current_objective = command
         self._log_thinking(
             "Interpreting the user objective into MCP-only sector tasks with battery-aware and self-healing coordination."
         )

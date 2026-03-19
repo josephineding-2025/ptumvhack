@@ -1,116 +1,222 @@
 # Aegis Swarm
 
-Aegis Swarm is an edge-first drone orchestration simulation for disaster Search and Rescue.  
-It connects an AI orchestrator, an MCP server bridge, and a 2D simulation so drone fleets can be discovered dynamically, assigned missions, monitored for battery limits, and re-routed when failures happen.
+Aegis Swarm is an edge-first drone swarm simulation for disaster search and rescue. It combines a central AI coordinator, an MCP tool bridge, and a 2D grid environment where drones search for survivors, manage battery constraints, recover from failures, and keep coverage progressing under degraded connectivity.
 
-This repository is scaffolded for "Case Study 3: First Responder of the Future - Decentralised Swarm Intelligence" with mandatory MCP-only agent control.
+This repository was built around the disaster-response swarm intelligence case study, with MCP-only control as a core constraint.
 
-## Setup
-1. Install Python 3.10+.
-2. From the repository root, run:
-```powershell
-.\tools\setup.ps1
-```
-3. Create your environment file:
-```powershell
-Copy-Item .env.example .env
-```
-4. Fill required values in `.env`:
-- `OPENROUTER_API_KEY`
-- `OPENROUTER_BASE_URL` (default: `https://openrouter.ai/api/v1`)
-- `OPENROUTER_MODEL` (default: `arcee-ai/trinity-large-preview:free`)
+## Highlights
 
-If your OpenRouter account has no credits, use the default free model above. You still need a valid `OPENROUTER_API_KEY`.
+- Dynamic fleet discovery through MCP tools
+- Battery-aware waypoint assignment and return-to-base behavior
+- Edge-side autonomous pathing and collision handling
+- Self-healing reassignment when a drone goes offline
+- Visual command-center panel for live mission monitoring
+- Local or cloud-backed LLM control paths
 
-## Required MCP Tool Names
+## Architecture
+
+The project is split into four main parts:
+
+- `agent/`: central orchestration, prompts, and visual control loop
+- `server/`: FastMCP bridge exposing the required drone tools
+- `sim/`: grid simulation, drone behavior, charging, movement, and renderer
+- `tests/`: behavior and mission-level checks
+
+Core MCP tools exposed by the bridge:
+
 - `list_drones()`
 - `move_to(drone_id, x, y)`
 - `get_battery_status(drone_id)`
 - `thermal_scan(drone_id)`
+- `get_mission_status()`
 
-## MCP Tool Return Format (JSON)
-All MCP tools return JSON objects with a consistent envelope:
+All MCP tools return a consistent JSON envelope:
+
 - Success: `{"ok": true, "data": ...}`
 - Error: `{"ok": false, "error": {"code": "...", "message": "...", "details": ...}}`
 
-## Quick Start (Scaffold Demo)
-1. Run orchestrator startup mission:
-```powershell
-python -m agent.orchestrator
+## Repository Layout
+
+```text
+agent/
+  orchestrator.py
+  prompts.py
+  visual_offline_panel.py
+server/
+  fastmcp_bridge.py
+sim/
+  environment.py
+  pygame_renderer.py
+tests/
+tools/
+requirements.txt
+README.md
 ```
-2. Run MCP server bridge:
+
+## Requirements
+
+- Python 3.10+
+- PowerShell on Windows for the setup script
+- An installed `mesa` dependency for the simulation
+- Optional:
+  - Ollama for local models
+  - OpenRouter API key for cloud inference
+
+## Setup
+
+1. Install Python 3.10 or newer.
+2. From the repository root, run:
+
+```powershell
+.\tools\setup.ps1
+```
+
+3. Create your local environment file:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+4. Fill in the values you need in `.env`.
+
+Common variables:
+
+- `OPENROUTER_API_KEY`
+- `OPENROUTER_BASE_URL` default: `https://openrouter.ai/api/v1`
+- `OPENROUTER_MODEL` default: `arcee-ai/trinity-large-preview:free`
+- `OLLAMA_BASE_URL` default: `http://127.0.0.1:11434/v1`
+- `OLLAMA_MODEL` default: `qwen3:8b`
+- `MCP_COMMAND`
+- `MCP_ARGS`
+
+If you use OpenRouter's free model, you still need a valid API key.
+
+## Quick Start
+
+Run the MCP bridge:
+
 ```powershell
 python -m server.fastmcp_bridge
 ```
-3. Optional simulation renderer:
+
+Run the orchestrator:
+
+```powershell
+python -m agent.orchestrator
+```
+
+Run the simulation renderer directly:
+
 ```powershell
 python -c "from sim.environment import SimulationEnvironment; from sim.pygame_renderer import PygameRenderer; PygameRenderer(SimulationEnvironment()).run()"
 ```
 
-## Offline Agent (Ollama + MCP)
-Use this path when cloud models are unavailable.
+## Visual Command Center
 
-1. Install dependencies once:
+Primary run command with OpenRouter:
+
 ```powershell
-.\tools\setup.ps1
+.\.venv\Scripts\python.exe -m agent.visual_offline_panel --provider openrouter --rounds 0
 ```
-2. Start Ollama service:
+
+Backup run command with Ollama:
+
+```powershell
+.\.venv\Scripts\python.exe -m agent.visual_offline_panel --provider ollama --rounds 0
+```
+
+OpenRouter with an explicit model and mission command:
+
+```powershell
+.\.venv\Scripts\python.exe -m agent.visual_offline_panel --provider openrouter --model arcee-ai/trinity-large-preview:free --command "Start SAR mission, maximize coverage, and report survivors." --rounds 0
+```
+
+Ollama with an explicit local model and mission command:
+
+```powershell
+.\.venv\Scripts\python.exe -m agent.visual_offline_panel --provider ollama --model qwen3:8b --command "Start SAR mission, maximize coverage, and report survivors." --rounds 0
+```
+
+Automatic provider selection:
+
+```powershell
+.\.venv\Scripts\python.exe -m agent.visual_offline_panel --provider auto --command "Start SAR mission and keep patrolling while scanning." --rounds 0
+```
+
+## Offline Ollama Workflow
+
+Use this path when you want fully local planning.
+
+1. Start Ollama:
+
 ```powershell
 ollama serve
 ```
-3. Ensure model is present:
+
+2. Pull the model if needed:
+
 ```powershell
 ollama pull qwen3:8b
 ```
-4. Verify MCP bridge and tools (no LLM involved):
+
+3. Smoke-test the MCP bridge:
+
 ```powershell
 python .\tools\mcp_smoke_test.py
 ```
-5. Run the offline agent (it will spawn MCP bridge via stdio):
+
+4. Run the offline MCP-driven agent:
+
 ```powershell
 python -m agent.offline_ollama_mcp_agent --command "Start SAR mission and maximize coverage"
 ```
 
-The offline runner uses:
-- `OLLAMA_BASE_URL` (default `http://127.0.0.1:11434/v1`)
-- `OLLAMA_MODEL` (default `qwen3:8b`)
-- `MCP_COMMAND` + `MCP_ARGS` (default `<current interpreter> -m server.fastmcp_bridge`)
+## Orchestrator Modes
 
-### MCP stdio troubleshooting (Windows)
-If you see JSON-RPC parse errors like `Invalid JSON ... input_value='\\n'`, remove stale override values in `.env`:
-```powershell
-MCP_COMMAND=
-MCP_ARGS=-m server.fastmcp_bridge
-```
-This forces the agent to launch MCP with the same Python interpreter already running your program.
+Strict MCP backend:
 
-## Orchestrator Backends
-- Default strict MCP transport path:
 ```powershell
 python -m agent.orchestrator --tool-backend mcp --iterations 50
 ```
-- Local debug path with renderer:
+
+Local debug backend with renderer:
+
 ```powershell
 python -m agent.orchestrator --tool-backend local --render --iterations 50
 ```
 
-## Visual AI Command Center
-Run your agent with a simulation panel and a live thinking box:
+## Windows MCP Troubleshooting
+
+If you hit JSON-RPC parse issues such as invalid newline input on Windows, clear stale `.env` overrides and keep the MCP launch command simple:
+
 ```powershell
-python -m agent.visual_offline_panel --provider ollama --command "Start SAR mission, maximize coverage, and report survivors." --rounds 20
+MCP_COMMAND=
+MCP_ARGS=-m server.fastmcp_bridge
 ```
 
-Use local model explicitly:
+That makes the agent reuse the current Python interpreter for the MCP bridge.
+
+## Testing
+
+Run the test suite with:
+
 ```powershell
-python -m agent.visual_offline_panel --provider ollama --model qwen3:8b --command "Start SAR mission, maximize coverage, and report survivors."
+py -m pytest
 ```
 
-Use cloud model explicitly with a free OpenRouter model:
-```powershell
-python -m agent.visual_offline_panel --provider openrouter --model arcee-ai/trinity-large-preview:free --command "Start SAR mission, maximize coverage, and report survivors."
-```
+If tests fail during import with `ModuleNotFoundError: No module named 'mesa'`, install project dependencies first.
 
-Automatic mode (cloud when reachable, local otherwise):
-```powershell
-python -m agent.visual_offline_panel --provider auto --command "Start SAR mission and keep patrolling while scanning."
-```
+## Current Behavior
+
+The simulation currently includes:
+
+- launch gating so drones recharge at base before redeployment
+- return-reserve battery checks before waypoint assignment
+- central swarm shaping using a coordinated wavefront search pattern
+- automatic recall and continued mission progress after failures
+
+## Notes
+
+- This repository may contain local experimental changes while development is in progress.
+- The visual panel is intended for demos, debugging, and case-study presentation flow.
+- If you plan to publish this publicly, add a license file and screenshots/GIFs for stronger GitHub presentation.
