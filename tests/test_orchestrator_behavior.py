@@ -109,8 +109,8 @@ def test_base_drone_keeps_charging_until_dispatch_ready() -> None:
 
     status_after_charge = env.get_battery_status("DR-01")
 
-    assert status_after_charge["battery"] == 45
-    assert status_after_charge["status"] == DroneStatus.IDLE.value
+    assert status_after_charge["battery"] == 25
+    assert status_after_charge["status"] == DroneStatus.CHARGING.value
 
     env.drones["DR-01"].battery = 20
     env.drones["DR-01"].location = (0, 0)
@@ -118,8 +118,8 @@ def test_base_drone_keeps_charging_until_dispatch_ready() -> None:
 
     charging_status = env.get_battery_status("DR-01")
 
-    assert charging_status["battery"] == 45
-    assert charging_status["status"] == DroneStatus.IDLE.value
+    assert charging_status["battery"] == 25
+    assert charging_status["status"] == DroneStatus.CHARGING.value
 
     env.drones["DR-01"].battery = 20
     env.drones["DR-01"].status = DroneStatus.IDLE
@@ -128,6 +128,14 @@ def test_base_drone_keeps_charging_until_dispatch_ready() -> None:
 
     assert "still charging at base" in move_message
     assert env.drones["DR-01"].status == DroneStatus.CHARGING
+
+    env.drones["DR-01"].battery = 100
+    env.drones["DR-01"].status = DroneStatus.IDLE
+
+    launch_message = env.move_drone("DR-01", 4, 4)
+
+    assert "accepted waypoint" in launch_message
+    assert env.drones["DR-01"].status == DroneStatus.SEARCHING
 
 
 def test_mission_ends_and_returns_all_drones_when_survivors_found() -> None:

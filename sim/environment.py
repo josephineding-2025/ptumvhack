@@ -1,3 +1,4 @@
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, Set, Tuple
@@ -58,6 +59,12 @@ class DroneMesaAgent(Agent):
         # Keep short tabu window to avoid oscillation, but still allow eventual revisits.
         self.drone_state.metadata["recent_positions"] = history[-8:]
 
+    def _previous_position(self) -> GridPoint | None:
+        history = self._recent_positions()
+        if len(history) < 2:
+            return None
+        return history[-2]
+
     def _candidate_steps_toward(self, target: GridPoint) -> list[GridPoint]:
         x, y = self.drone_state.location
         tx, ty = target
@@ -97,7 +104,10 @@ class DroneMesaAgent(Agent):
 
     def _feasible_candidates(self, waypoint: GridPoint) -> list[GridPoint]:
         feasible: list[GridPoint] = []
+        previous = self._previous_position()
         for candidate in self._candidate_steps_toward(waypoint):
+            if previous is not None and candidate == previous:
+                continue
             # Battery reserve policy: every step must preserve enough charge to reach base.
             post_battery = int(self.drone_state.battery) - int(self.model.move_cost_per_cell)
             if post_battery < 0:
@@ -191,11 +201,98 @@ class SwarmMesaModel(Model):
             if agent.drone_state.status != DroneStatus.OFFLINE:
                 yield agent
 
+    @staticmethod
+    def _heading_from_vectors(vectors: list[tuple[int, int]]) -> str:
+        if not vectors:
+            return "east"
+        sum_dx = sum(vector[0] for vector in vectors)
+        sum_dy = sum(vector[1] for vector in vectors)
+        if abs(sum_dx) >= abs(sum_dy):
+            return "east" if sum_dx >= 0 else "west"
+        return "south" if sum_dy >= 0 else "north"
+
+    @staticmethod
+    def _formation_offsets(heading: str, count: int, tick_count: int) -> list[GridPoint]:
+        diagonal_patterns = {
+            "east": [
+                [(0, 0), (-1, -1), (-1, 1), (-2, -2), (-2, 0), (-2, 2), (-3, -1), (-3, 1)],
+                [(0, 0), (-1, 0), (-2, -1), (-2, 1), (-3, -2), (-3, 0), (-3, 2), (-4, -1)],
+            ],
+            "west": [
+                [(0, 0), (1, 1), (1, -1), (2, 2), (2, 0), (2, -2), (3, 1), (3, -1)],
+                [(0, 0), (1, 0), (2, 1), (2, -1), (3, 2), (3, 0), (3, -2), (4, 1)],
+            ],
+            "south": [
+                [(0, 0), (-1, -1), (1, -1), (-2, -2), (0, -2), (2, -2), (-1, -3), (1, -3)],
+                [(0, 0), (0, -1), (-1, -2), (1, -2), (-2, -3), (0, -3), (2, -3), (-1, -4)],
+            ],
+            "north": [
+                [(0, 0), (1, 1), (-1, 1), (2, 2), (0, 2), (-2, 2), (1, 3), (-1, 3)],
+                [(0, 0), (0, 1), (1, 2), (-1, 2), (2, 3), (0, 3), (-2, 3), (1, 4)],
+            ],
+        }
+        pattern_family = diagonal_patterns[heading]
+        pattern = pattern_family[tick_count % len(pattern_family)]
+        return pattern[:count]
+
+    def _formation_targets(self, agents: list[DroneMesaAgent]) -> dict[str, GridPoint]:
+        moving_agents = [agent for agent in agents if agent.waypoint() is not None]
+        if not moving_agents:
+            return {}
+        heading_vectors: list[tuple[int, int]] = []
+        for agent in moving_agents:
+            waypoint = agent.waypoint()
+            if waypoint is None:
+                continue
+            current = agent.drone_state.location
+            heading_vectors.append((int(waypoint[0]) - int(current[0]), int(waypoint[1]) - int(current[1])))
+        heading = self._heading_from_vectors(heading_vectors)
+
+        def leader_key(agent: DroneMesaAgent) -> tuple[int, int, str]:
+            x, y = agent.drone_state.location
+            if heading == "east":
+                return (x, -y, agent.drone_id)
+            if heading == "west":
+                return (-x, y, agent.drone_id)
+            if heading == "south":
+                return (y, -x, agent.drone_id)
+            return (-y, x, agent.drone_id)
+
+        leader = max(moving_agents, key=leader_key)
+        leader_x, leader_y = leader.drone_state.location
+        ordered_agents = [leader] + sorted(
+            [agent for agent in moving_agents if agent.drone_id != leader.drone_id],
+            key=lambda agent: agent.drone_id,
+        )
+        offsets = self._formation_offsets(heading, len(ordered_agents), self.tick_count)
+        return {
+            agent.drone_id: (leader_x + offset[0], leader_y + offset[1])
+            for agent, offset in zip(ordered_agents, offsets, strict=False)
+        }
+
+    @staticmethod
+    def _candidate_score(
+        candidate: GridPoint,
+        waypoint: GridPoint,
+        formation_target: GridPoint | None,
+        base_station: GridPoint,
+    ) -> tuple[int, int, int, int, int]:
+        formation_distance = (
+            abs(candidate[0] - formation_target[0]) + abs(candidate[1] - formation_target[1])
+            if formation_target is not None
+            else 0
+        )
+        waypoint_distance = abs(candidate[0] - waypoint[0]) + abs(candidate[1] - waypoint[1])
+        base_distance = abs(candidate[0] - base_station[0]) + abs(candidate[1] - base_station[1])
+        return (formation_distance, waypoint_distance, -base_distance, candidate[1], candidate[0])
+
     def step(self) -> None:
         self.tick_count += 1
         online_agents = list(self._online_agents())
         occupied_now = {agent.drone_state.location for agent in online_agents}
+        formation_targets = self._formation_targets(online_agents)
         proposed_targets: dict[str, list[GridPoint]] = {}
+        formation_tolerance = 2
         for agent in online_agents:
             if agent.drone_state.status == DroneStatus.CHARGING:
                 continue
@@ -215,6 +312,24 @@ class SwarmMesaModel(Model):
             if not candidates:
                 agent.apply_post_move_status()
                 continue
+            active_waypoint = agent.waypoint() or waypoint
+            formation_target = formation_targets.get(agent.drone_id)
+            candidates.sort(
+                key=lambda candidate: self._candidate_score(
+                    candidate,
+                    active_waypoint,
+                    formation_target,
+                    self.base_station,
+                )
+            )
+            if formation_target is not None:
+                pattern_locked = [
+                    candidate
+                    for candidate in candidates
+                    if abs(candidate[0] - formation_target[0]) + abs(candidate[1] - formation_target[1]) <= formation_tolerance
+                ]
+                if pattern_locked:
+                    candidates = pattern_locked
             proposed_targets[agent.drone_id] = candidates
 
         # Deadlock-resistant local negotiation:
@@ -285,15 +400,18 @@ class SimulationEnvironment:
     move_cost_per_cell: int = 1
     scan_cost: int = 2
     recall_threshold: int = 15
-    dispatch_ready_threshold: int = 30
-    charge_rate: int = 25
+    dispatch_ready_threshold: int = 100
+    charge_rate: int = 5
     edge_tick_interval_sec: float = 0.14
     drones: Dict[str, DroneState] = field(default_factory=dict)
     survivors: Set[GridPoint] = field(default_factory=set)
     searched_cells: Set[GridPoint] = field(default_factory=set)
     found_survivors: Set[GridPoint] = field(default_factory=set)
+    tree_cells: Set[GridPoint] = field(default_factory=set)
 
     def __post_init__(self) -> None:
+        if not self.tree_cells:
+            self.tree_cells = self._generate_tree_cells()
         self._model = SwarmMesaModel(
             width=self.width,
             height=self.height,
@@ -322,6 +440,8 @@ class SimulationEnvironment:
         self._model._mark_searched = self._mark_searched  # type: ignore[method-assign]
 
     def seed_default_scenario(self) -> None:
+        self.survivors = {(3, 3), (9, 14), (15, 6), (12, 12), (18, 2)}
+        self.tree_cells = self._generate_tree_cells()
         self._reset_model()
         self.drones = {
             "DR-01": DroneState(drone_id="DR-01", location=self.base_station),
@@ -332,7 +452,44 @@ class SimulationEnvironment:
         for drone in self.drones.values():
             self._model.add_drone(drone)
             self._mark_searched(drone.location)
-        self.survivors = {(3, 3), (9, 14), (15, 6), (12, 12), (18, 2)}
+
+    def _generate_river_cells(self) -> Set[GridPoint]:
+        river: Set[GridPoint] = set()
+        for y in range(self.height):
+            center = int(round(4 + 0.22 * y + 1.3 * math.sin(y * 0.55)))
+            for dx in (-1, 0, 1):
+                x = center + dx
+                if 0 <= x < self.width:
+                    river.add((x, y))
+        return river
+
+    def _generate_tree_cells(self) -> Set[GridPoint]:
+        trees: Set[GridPoint] = set()
+        river_cells = self._generate_river_cells()
+        reserved = set(self.survivors) | {self.base_station} | river_cells
+        cluster_centers = [(2, 15), (6, 4), (10, 16), (14, 8), (17, 13)]
+        for x in range(self.width):
+            for y in range(self.height):
+                point = (x, y)
+                if point in reserved:
+                    continue
+                if x <= 2 and y <= 2:
+                    continue
+                nearest_cluster = min(abs(x - cx) + abs(y - cy) for cx, cy in cluster_centers)
+                scatter = (x * 13 + y * 17 + x * y * 5) % 19
+                diagonal_bias = (x - 2 * y) % 11
+                if nearest_cluster <= 2 and scatter in {0, 3, 7, 11, 14}:
+                    trees.add(point)
+                    continue
+                if nearest_cluster <= 4 and diagonal_bias in {0, 1} and scatter in {2, 5, 9}:
+                    trees.add(point)
+                    continue
+                if scatter == 0 and (x + y) % 3 == 0:
+                    trees.add(point)
+        return trees
+
+    def is_tree_cell(self, point: GridPoint) -> bool:
+        return (int(point[0]), int(point[1])) in self.tree_cells
 
     @staticmethod
     def _serialize_points(points: Set[GridPoint]) -> list[list[int]]:

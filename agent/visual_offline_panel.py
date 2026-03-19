@@ -7,6 +7,7 @@ import sys
 import threading
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -53,14 +54,18 @@ class VisualConfig:
 @dataclass
 class VisualState:
     logs: deque[str] = field(default_factory=lambda: deque(maxlen=240))
+    full_logs: list[str] = field(default_factory=list)
     pending_commands: deque[str] = field(default_factory=deque)
     pending_offline_ids: deque[str] = field(default_factory=deque)
     lock: threading.RLock = field(default_factory=threading.RLock)
     done: bool = False
+    mission_complete: bool = False
+    exported_log_path: str | None = None
 
     def push(self, message: str) -> None:
         with self.lock:
             self.logs.append(message)
+            self.full_logs.append(message)
 
     def push_command(self, command: str) -> None:
         text = command.strip()
@@ -73,6 +78,10 @@ class VisualState:
     def get_logs(self) -> list[str]:
         with self.lock:
             return list(self.logs)
+
+    def get_full_logs(self) -> list[str]:
+        with self.lock:
+            return list(self.full_logs)
 
     def pop_command(self) -> str | None:
         with self.lock:
@@ -94,6 +103,19 @@ class VisualState:
     def mark_done(self) -> None:
         with self.lock:
             self.done = True
+
+    def set_mission_complete(self, exported_log_path: str | None = None) -> None:
+        with self.lock:
+            self.mission_complete = True
+            self.exported_log_path = exported_log_path
+
+    def get_completion_state(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "done": self.done,
+                "mission_complete": self.mission_complete,
+                "exported_log_path": self.exported_log_path,
+            }
 
 
 @dataclass
@@ -147,6 +169,65 @@ def _extract_agent_text(result: Any) -> str:
                 if isinstance(dict_content, str):
                     return dict_content
     return str(result)
+
+
+def _build_mission_log_markdown(
+    command: str,
+    mission_status: dict[str, Any],
+    drones: list[dict[str, Any]],
+    logs: list[str],
+) -> str:
+    grid_size = mission_status.get("grid_size", [20, 20])
+    offline_ids = [str(item) for item in mission_status.get("offline_drone_ids", [])]
+    total_battery = sum(int(drone.get("battery", 0)) for drone in drones)
+    average_battery = (total_battery / len(drones)) if drones else 0.0
+    coverage_pct = float(mission_status.get("coverage_ratio", 0.0)) * 100.0
+    survivors_found = int(mission_status.get("survivors_found", 0))
+
+    lines = [
+        "# Mission Log",
+        "",
+        "## Demo Session Metadata",
+        f"- Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- Objective: {command or 'N/A'}",
+        f"- Grid Size: {grid_size[0]}x{grid_size[1]}" if isinstance(grid_size, list) and len(grid_size) == 2 else "- Grid Size: N/A",
+        f"- Active Drones at End: {mission_status.get('active_drones', 0)}",
+        f"- Total Drones: {mission_status.get('total_drones', 0)}",
+        "",
+        "## Search Log",
+    ]
+    for entry in logs:
+        lines.append(f"- {entry}")
+
+    lines.extend(
+        [
+            "",
+            "## Mission Post-Mortem Table",
+            "| Metric | Value |",
+            "| :--- | :--- |",
+            f"| Total Grid Covered (%) | {coverage_pct:.1f} |",
+            f"| Survivors Rescued (Count) | {survivors_found} |",
+            f"| Average Battery Remaining (%) | {average_battery:.1f} |",
+            f"| Drones Lost in Action (Count) | {len(offline_ids)} |",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _export_mission_log(
+    command: str,
+    mission_status: dict[str, Any],
+    drones: list[dict[str, Any]],
+    logs: list[str],
+) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(os.getcwd(), "outputs", "mission_logs")
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"mission_log_{timestamp}.md")
+    content = _build_mission_log_markdown(command, mission_status, drones, logs)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    return path
 
 
 def _host_reachable(url: str, timeout_sec: float = 2.0) -> bool:
@@ -677,6 +758,15 @@ async def run_visual_agent(
                         "<thinking>Mission completion condition met. Edge drones are autonomously returning to base under Mesa completion policy.</thinking>"
                     )
                     ui.push("[agent] MISSION COMPLETE")
+                    await _refresh_snapshot(tool_map, snapshot)
+                    exported_path = _export_mission_log(
+                        active_command,
+                        snapshot.get_status(),
+                        snapshot.get_drones(),
+                        ui.get_full_logs(),
+                    )
+                    ui.push(f"[agent] Mission log saved: {exported_path}")
+                    ui.set_mission_complete(exported_path)
                     break
 
                 # Central wave control: assign waypoints, wait for completion, then reassign next wave.
@@ -777,11 +867,12 @@ def main() -> None:
     renderer = PygameRenderer(
         renderer_env,
         cell_size=args.cell_size,
-        log_provider=ui.get_logs,
+        log_provider=ui.get_full_logs,
         status_provider=status_provider,
         fleet_provider=fleet_provider,
         command_submitter=submit_command,
         offline_submitter=submit_offline,
+        completion_provider=ui.get_completion_state,
         state_lock=snapshot.lock,
     )
     renderer.run()
