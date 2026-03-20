@@ -1,6 +1,9 @@
 from agent.orchestrator import AgentConfig, LocalToolClient, SwarmOrchestrator
+from agent.visual_offline_panel import _build_mission_log_markdown
 from models.drone_state import DroneStatus
 from server.fastmcp_bridge import env
+from sim.environment import SimulationEnvironment
+from sim.pygame_renderer import PygameRenderer
 
 
 def reset_environment() -> None:
@@ -180,3 +183,60 @@ def test_full_grid_scan_completes_and_recalls_all_drones() -> None:
     assert env.drones["DR-02"].location == (0, 0)
     assert env.drones["DR-03"].location == (0, 0)
     assert env.drones["DR-04"].location == (0, 0)
+
+
+def test_mission_log_markdown_includes_thinking_timeline() -> None:
+    content = _build_mission_log_markdown(
+        command="Find survivors",
+        mission_status={
+            "grid_size": [20, 20],
+            "coverage_ratio": 0.5,
+            "survivors_found": 1,
+            "active_drones": 3,
+            "total_drones": 4,
+            "offline_drone_ids": ["DR-04"],
+        },
+        drones=[
+            {"id": "DR-01", "battery": 60},
+            {"id": "DR-02", "battery": 40},
+        ],
+        logs=[
+            "<thinking>Rebalancing around the east sector.</thinking>",
+            "[tool] list_drones -> 3 active",
+        ],
+    )
+
+    assert "## Thinking Timeline" in content
+    assert "<thinking>Rebalancing around the east sector.</thinking>" in content
+    assert "## Search Log" in content
+
+
+def test_read_mission_log_lines_prefers_search_log_entries(tmp_path) -> None:
+    mission_log = tmp_path / "mission_log.md"
+    mission_log.write_text(
+        "\n".join(
+            [
+                "# Mission Log",
+                "",
+                "## Demo Session Metadata",
+                "- Objective: demo",
+                "",
+                "## Thinking Timeline",
+                "- <thinking>Initial fleet discovery.</thinking>",
+                "",
+                "## Search Log",
+                "- <thinking>Initial fleet discovery.</thinking>",
+                "- [tool] list_drones -> 4 active",
+                "",
+                "## Mission Post-Mortem Table",
+                "| Metric | Value |",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    renderer = PygameRenderer(SimulationEnvironment())
+    lines = renderer._read_mission_log_lines(str(mission_log), max_lines=5)
+
+    assert "Initial fleet discovery." in lines
+    assert "[tool] list_drones -> 4 active" in lines

@@ -13,7 +13,7 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 
 from agent.prompts import user_command_prompt
 
-logger = logging.getLogger("aegis.orchestrator")
+logger = logging.getLogger("drone_promax.orchestrator")
 
 
 class ToolClient(Protocol):
@@ -67,7 +67,7 @@ class MCPToolClient:
             configured_command = default_python
         self._client = MultiServerMCPClient(
             {
-                "aegis_swarm": {
+                "drone_promax": {
                     "transport": "stdio",
                     # Use the active interpreter by default to avoid PATH/alias issues on Windows.
                     "command": configured_command,
@@ -504,7 +504,7 @@ class SwarmOrchestrator:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run Aegis swarm orchestrator mission loop.")
+    parser = argparse.ArgumentParser(description="Run drone promax orchestrator mission loop.")
     parser.add_argument("--iterations", type=int, default=50, help="Mission loop iterations.")
     parser.add_argument(
         "--tool-backend",

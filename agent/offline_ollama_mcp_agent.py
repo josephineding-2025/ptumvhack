@@ -38,7 +38,7 @@ async def run_agent(command: str) -> dict[str, Any]:
 
     client = MultiServerMCPClient(
         {
-            "aegis_swarm": {
+            "drone_promax": {
                 "transport": "stdio",
                 "command": config.mcp_command,
                 "args": list(config.mcp_args),
@@ -71,7 +71,7 @@ def main() -> None:
     load_dotenv()
 
     parser = argparse.ArgumentParser(
-        description="Run Aegis Swarm with local Ollama model through MCP (offline-first)."
+        description="Run drone promax with local Ollama model through MCP (offline-first)."
     )
     parser.add_argument(
         "--command",

@@ -1,71 +1,81 @@
-# Aegis Swarm
+# Drone Promax
 
-Aegis Swarm is an edge-first drone swarm simulation for disaster search and rescue. It combines a central AI coordinator, an MCP tool bridge, and a 2D grid environment where drones search for survivors, manage battery constraints, recover from failures, and keep coverage progressing under degraded connectivity.
+`Drone Promax` is an edge-first autonomous drone swarm simulation for disaster search-and-rescue in low-connectivity environments.
 
-This repository was built around the disaster-response swarm intelligence case study, with MCP-only control as a core constraint.
+This project demonstrates how an AI coordinator can control a fleet through MCP tools only, while handling battery limits, drone failures, and real-time mission coverage.
 
-## Highlights
+## Why This Matters (Hackathon Context)
 
-- Dynamic fleet discovery through MCP tools
-- Battery-aware waypoint assignment and return-to-base behavior
-- Edge-side autonomous pathing and collision handling
-- Self-healing reassignment when a drone goes offline
-- Visual command-center panel for live mission monitoring
-- Local or cloud-backed LLM control paths
+In the first 72 hours after disasters, cloud connectivity can fail but rescue decisions still need to continue.
 
-## Architecture
+`drone promax` focuses on:
+- resilient autonomous coordination
+- decentralized recovery behavior
+- practical mission visibility for command teams
 
-The project is split into four main parts:
+## What the Judges Should Look For
 
-- `agent/`: central orchestration, prompts, and visual control loop
-- `server/`: FastMCP bridge exposing the required drone tools
-- `sim/`: grid simulation, drone behavior, charging, movement, and renderer
-- `tests/`: behavior and mission-level checks
+- End-to-end MCP-driven orchestration (no direct hidden control path)
+- Dynamic drone discovery and assignment
+- Battery-aware planning with return-to-base logic
+- Self-healing task reassignment when drones go offline
+- Live visual command-center style monitoring
 
-Core MCP tools exposed by the bridge:
+## Core Features
 
-- `list_drones()`
-- `move_to(drone_id, x, y)`
-- `get_battery_status(drone_id)`
-- `thermal_scan(drone_id)`
-- `get_mission_status()`
+- Autonomous mission planning from high-level command input
+- Runtime tool-based fleet discovery with `list_drones()`
+- Path and scan execution via `move_to(...)` and `thermal_scan(...)`
+- Safety checks with `get_battery_status(...)`
+- Mission status monitoring with `get_mission_status()`
+- Local (Ollama) and cloud (OpenRouter) LLM provider options
 
-All MCP tools return a consistent JSON envelope:
+## System Architecture
 
-- Success: `{"ok": true, "data": ...}`
-- Error: `{"ok": false, "error": {"code": "...", "message": "...", "details": ...}}`
+- `agent/`: orchestrator, prompt policy, visual panel, offline MCP agent
+- `server/`: FastMCP bridge and tool contracts
+- `sim/`: deterministic grid simulation and pygame renderer
+- `models/`: drone state model definitions
+- `tests/`: mission and behavior validation
 
 ## Repository Layout
 
 ```text
 agent/
+  offline_ollama_mcp_agent.py
   orchestrator.py
   prompts.py
   visual_offline_panel.py
+docs/
+models/
+outputs/
 server/
   fastmcp_bridge.py
 sim/
   environment.py
   pygame_renderer.py
+models/
+  drone_state.py
 tests/
 tools/
-requirements.txt
 README.md
+SPEC.md
+requirements.txt
 ```
 
-## Requirements
+## Tech Stack
 
 - Python 3.10+
-- PowerShell on Windows for the setup script
-- An installed `mesa` dependency for the simulation
-- Optional:
-  - Ollama for local models
-  - OpenRouter API key for cloud inference
+- FastMCP-style tool bridge
+- Pygame simulation renderer
+- An installed 'mesa' dependency for the simulation
+- LLM provider options:
+  - OpenRouter (cloud)
+  - Ollama : qwen3 8B (local/offline-friendly)
 
-## Setup
+## Quick Start (Windows / PowerShell)
 
-1. Install Python 3.10 or newer.
-2. From the repository root, run:
+1. Install dependencies:
 
 ```powershell
 .\tools\setup.ps1
@@ -89,7 +99,6 @@ Common variables:
 - `MCP_COMMAND`
 - `MCP_ARGS`
 
-If you use OpenRouter's free model, you still need a valid API key.
 
 ## Quick Start
 
@@ -99,124 +108,61 @@ Run the MCP bridge:
 python -m server.fastmcp_bridge
 ```
 
-Run the orchestrator:
+3. Start orchestrator:
 
 ```powershell
 python -m agent.orchestrator
 ```
 
-Run the simulation renderer directly:
+## Demo Commands (Judge-Friendly)
 
-```powershell
-python -c "from sim.environment import SimulationEnvironment; from sim.pygame_renderer import PygameRenderer; PygameRenderer(SimulationEnvironment()).run()"
-```
-
-## Visual Command Center
-
-Primary run command with OpenRouter:
+Run visual command panel (OpenRouter):
 
 ```powershell
 .\.venv\Scripts\python.exe -m agent.visual_offline_panel --provider openrouter --rounds 0
 ```
 
-Backup run command with Ollama:
+Run visual command panel (Ollama fallback):
 
 ```powershell
 .\.venv\Scripts\python.exe -m agent.visual_offline_panel --provider ollama --rounds 0
 ```
 
-OpenRouter with an explicit model and mission command:
 
-```powershell
-.\.venv\Scripts\python.exe -m agent.visual_offline_panel --provider openrouter --model arcee-ai/trinity-large-preview:free --command "Start SAR mission, maximize coverage, and report survivors." --rounds 0
-```
+## MCP Tool Contract
 
-Ollama with an explicit local model and mission command:
+Required tools:
+- `list_drones()`
+- `move_to(drone_id, x, y)`
+- `get_battery_status(drone_id)`
+- `thermal_scan(drone_id)`
 
-```powershell
-.\.venv\Scripts\python.exe -m agent.visual_offline_panel --provider ollama --model qwen3:8b --command "Start SAR mission, maximize coverage, and report survivors." --rounds 0
-```
+Additional mission visibility tool:
+- `get_mission_status()`
 
-Automatic provider selection:
+Standard response shape:
+- success: `{"ok": true, "data": ...}`
+- error: `{"ok": false, "error": {"code": "...", "message": "...", "details": ...}}`
 
-```powershell
-.\.venv\Scripts\python.exe -m agent.visual_offline_panel --provider auto --command "Start SAR mission and keep patrolling while scanning." --rounds 0
-```
+## Validation
 
-## Offline Ollama Workflow
-
-Use this path when you want fully local planning.
-
-1. Start Ollama:
-
-```powershell
-ollama serve
-```
-
-2. Pull the model if needed:
-
-```powershell
-ollama pull qwen3:8b
-```
-
-3. Smoke-test the MCP bridge:
-
-```powershell
-python .\tools\mcp_smoke_test.py
-```
-
-4. Run the offline MCP-driven agent:
-
-```powershell
-python -m agent.offline_ollama_mcp_agent --command "Start SAR mission and maximize coverage"
-```
-
-## Orchestrator Modes
-
-Strict MCP backend:
-
-```powershell
-python -m agent.orchestrator --tool-backend mcp --iterations 50
-```
-
-Local debug backend with renderer:
-
-```powershell
-python -m agent.orchestrator --tool-backend local --render --iterations 50
-```
-
-## Windows MCP Troubleshooting
-
-If you hit JSON-RPC parse issues such as invalid newline input on Windows, clear stale `.env` overrides and keep the MCP launch command simple:
-
-```powershell
-MCP_COMMAND=
-MCP_ARGS=-m server.fastmcp_bridge
-```
-
-That makes the agent reuse the current Python interpreter for the MCP bridge.
-
-## Testing
-
-Run the test suite with:
+Run tests:
 
 ```powershell
 py -m pytest
 ```
 
-If tests fail during import with `ModuleNotFoundError: No module named 'mesa'`, install project dependencies first.
+Smoke-test MCP tool availability:
 
-## Current Behavior
+```powershell
+python .\tools\mcp_smoke_test.py
+```
 
-The simulation currently includes:
+## Impact Summary
 
-- launch gating so drones recharge at base before redeployment
-- return-reserve battery checks before waypoint assignment
-- central swarm shaping using a coordinated wavefront search pattern
-- automatic recall and continued mission progress after failures
+`drone promax` is designed to show practical autonomous resilience for emergency response:
+- keeps mission progress under degraded connectivity
+- reallocates tasks when units fail
+- protects uptime with battery-aware behavior
+- provides transparent, monitorable command flow for responders
 
-## Notes
-
-- This repository may contain local experimental changes while development is in progress.
-- The visual panel is intended for demos, debugging, and case-study presentation flow.
-- If you plan to publish this publicly, add a license file and screenshots/GIFs for stronger GitHub presentation.
