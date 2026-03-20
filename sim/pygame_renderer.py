@@ -110,6 +110,37 @@ class PygameRenderer:
             return []
         return lines[-max_lines:]
 
+    @classmethod
+    def _read_mission_log_lines(cls, path: str, max_lines: int = 22) -> list[str]:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                lines = [line.rstrip("\n") for line in handle.readlines()]
+        except OSError:
+            return []
+
+        heading_indices = {
+            line.strip(): idx
+            for idx, line in enumerate(lines)
+            if line.startswith("## ")
+        }
+        search_log_start = heading_indices.get("## Search Log")
+        if search_log_start is not None:
+            extracted: list[str] = []
+            for line in lines[search_log_start + 1:]:
+                if line.startswith("## "):
+                    break
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith("- "):
+                    stripped = stripped[2:]
+                thinking = cls._extract_thinking(stripped)
+                extracted.append(thinking if thinking is not None else stripped)
+            if extracted:
+                return extracted[-max_lines:]
+
+        return cls._read_text_file_tail(path, max_lines=max_lines)
+
     @staticmethod
     def _drone_payload(drone: Any) -> dict[str, Any]:
         if isinstance(drone, dict):
@@ -157,7 +188,7 @@ class PygameRenderer:
         grid_w = self.env.width * self.cell_size
         grid_h = self.env.height * self.cell_size
         screen = pygame.display.set_mode((grid_w + self.panel_width, grid_h))
-        pygame.display.set_caption("Aegis Swarm Simulation")
+        pygame.display.set_caption("drone promax Simulation")
         clock = pygame.time.Clock()
         title_font = pygame.font.SysFont("bahnschrift", 22, bold=True)
         small_font = pygame.font.SysFont("consolas", 14)
@@ -549,7 +580,7 @@ class PygameRenderer:
 
                 mission_lines: list[str] = []
                 if exported_log_path and os.path.exists(exported_log_path):
-                    mission_lines = self._read_text_file_tail(exported_log_path, max_lines=22)
+                    mission_lines = self._read_mission_log_lines(exported_log_path, max_lines=22)
                 if not mission_lines:
                     for entry in logs[-22:]:
                         text = str(entry)

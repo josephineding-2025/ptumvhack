@@ -5,7 +5,7 @@
 - Lost rescue time from uncoordinated operations
 
 ## Slide 2 - Solution
-- Aegis Swarm: edge-first, autonomous drone orchestration
+- drone promax: edge-first, autonomous drone orchestration
 - MCP-based modular architecture
 
 ## Slide 3 - Architecture

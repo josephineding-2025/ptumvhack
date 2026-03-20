@@ -19,7 +19,7 @@ def normalize(raw: Any) -> dict:
 async def main() -> None:
     client = MultiServerMCPClient(
         {
-            "aegis_swarm": {
+            "drone_promax": {
                 "transport": "stdio",
                 "command": os.getenv("MCP_COMMAND", "python"),
                 "args": os.getenv("MCP_ARGS", "-m server.fastmcp_bridge").split(),
@@ -27,8 +27,8 @@ async def main() -> None:
         }
     )
 
-    async with client.session("aegis_swarm") as session:
-        tools = await load_mcp_tools(session, server_name="aegis_swarm")
+    async with client.session("drone_promax") as session:
+        tools = await load_mcp_tools(session, server_name="drone_promax")
         by_name: dict[str, Any] = {tool.name: tool for tool in tools}
         required = ("list_drones", "move_to", "get_battery_status", "thermal_scan", "get_mission_status")
         missing = [name for name in required if name not in by_name]

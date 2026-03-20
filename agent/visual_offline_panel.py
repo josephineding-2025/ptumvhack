@@ -183,6 +183,7 @@ def _build_mission_log_markdown(
     average_battery = (total_battery / len(drones)) if drones else 0.0
     coverage_pct = float(mission_status.get("coverage_ratio", 0.0)) * 100.0
     survivors_found = int(mission_status.get("survivors_found", 0))
+    thinking_entries = [entry for entry in logs if "<thinking>" in entry]
 
     lines = [
         "# Mission Log",
@@ -194,8 +195,20 @@ def _build_mission_log_markdown(
         f"- Active Drones at End: {mission_status.get('active_drones', 0)}",
         f"- Total Drones: {mission_status.get('total_drones', 0)}",
         "",
-        "## Search Log",
+        "## Thinking Timeline",
     ]
+    if thinking_entries:
+        for entry in thinking_entries:
+            lines.append(f"- {entry}")
+    else:
+        lines.append("- No <thinking> entries captured.")
+
+    lines.extend(
+        [
+            "",
+        "## Search Log",
+        ]
+    )
     for entry in logs:
         lines.append(f"- {entry}")
 
@@ -347,7 +360,7 @@ async def run_visual_agent(
 
     client = MultiServerMCPClient(
         {
-            "aegis_swarm": {
+            "drone_promax": {
                 "transport": "stdio",
                 "command": cfg.mcp_command,
                 "args": list(cfg.mcp_args),
@@ -356,12 +369,20 @@ async def run_visual_agent(
     )
 
     try:
-        async with client.session("aegis_swarm") as session:
-            loaded_tools = await load_mcp_tools(session, server_name="aegis_swarm")
+        async with client.session("drone_promax") as session:
+            loaded_tools = await load_mcp_tools(session, server_name="drone_promax")
             tool_map = {loaded_tool.name: loaded_tool for loaded_tool in loaded_tools}
             await _refresh_snapshot(tool_map, snapshot)
             assigned_waypoints: dict[str, tuple[int, int]] = {}
             round_stats: dict[str, int] = {"move_calls": 0, "status_calls": 0}
+
+            async def _call_tool_with_thinking(
+                tool_name: str,
+                payload: dict[str, Any],
+                thinking: str,
+            ) -> dict[str, Any]:
+                ui.push(f"<thinking>{thinking}</thinking>")
+                return _normalize_tool_response(await tool_map[tool_name].ainvoke(payload))
 
             def _location_for(drone_id: str) -> tuple[int, int] | None:
                 for item in snapshot.get_drones():
@@ -375,10 +396,11 @@ async def run_visual_agent(
             @tool
             async def list_drones() -> dict:
                 """List currently active drones."""
-                ui.push(
-                    "<thinking>I need live fleet discovery first so sector planning adapts to active drones and failures.</thinking>"
+                result = await _call_tool_with_thinking(
+                    "list_drones",
+                    {},
+                    "I am checking which drones are active first so I only assign sectors to available drones and can react to failures.",
                 )
-                result = _normalize_tool_response(await tool_map["list_drones"].ainvoke({}))
                 await _refresh_snapshot(tool_map, snapshot)
                 count = len(result.get("data", {}).get("drones", [])) if result.get("ok") else 0
                 ui.push(f"[tool] list_drones -> {count} active")
@@ -391,8 +413,10 @@ async def run_visual_agent(
                 current_loc = _location_for(drone_id)
                 existing = assigned_waypoints.get(drone_id)
                 if existing is not None and current_loc is not None and current_loc != existing:
-                    status = _normalize_tool_response(
-                        await tool_map["get_battery_status"].ainvoke({"drone_id": drone_id})
+                    status = await _call_tool_with_thinking(
+                        "get_battery_status",
+                        {"drone_id": drone_id},
+                        f"{drone_id} is already moving toward [{existing[0]},{existing[1]}], so I am checking its battery instead of interrupting the current assignment.",
                     )
                     await _refresh_snapshot(tool_map, snapshot)
                     return {
@@ -406,11 +430,10 @@ async def run_visual_agent(
                         },
                     }
 
-                ui.push(
-                    f"<thinking>{drone_id} is being assigned strategic waypoint [{target[0]},{target[1]}], while edge pathing handles local movement and collision avoidance.</thinking>"
-                )
-                result = _normalize_tool_response(
-                    await tool_map["move_to"].ainvoke({"drone_id": drone_id, "x": target[0], "y": target[1]})
+                result = await _call_tool_with_thinking(
+                    "move_to",
+                    {"drone_id": drone_id, "x": target[0], "y": target[1]},
+                    f"I am sending {drone_id} to [{target[0]},{target[1]}] because it has enough battery for the trip and this waypoint expands search coverage.",
                 )
                 round_stats["move_calls"] += 1
                 await _refresh_snapshot(tool_map, snapshot)
@@ -432,16 +455,17 @@ async def run_visual_agent(
             @tool
             async def thermal_scan(drone_id: str) -> dict:
                 """Run thermal scan at current drone location."""
-                ui.push(
-                    f"<thinking>{drone_id} reached a useful sector, so I am validating survivor presence with thermal sensing.</thinking>"
+                result = await _call_tool_with_thinking(
+                    "thermal_scan",
+                    {"drone_id": drone_id},
+                    f"{drone_id} reached a new sector, so I am running a thermal scan to check for survivors there.",
                 )
-                result = _normalize_tool_response(await tool_map["thermal_scan"].ainvoke({"drone_id": drone_id}))
                 await _refresh_snapshot(tool_map, snapshot)
                 if result.get("ok") and result.get("data", {}).get("detected"):
                     loc = result.get("data", {}).get("battery_status", {}).get("location", [0, 0])
                     if isinstance(loc, list) and len(loc) == 2:
                         ui.push(
-                            f"<thinking>Survivor detected at exact coordinates [{int(loc[0])}, {int(loc[1])}]. Continuing mission search.</thinking>"
+                            f"<thinking>I detected a survivor at exact coordinates [{int(loc[0])}, {int(loc[1])}], so I am logging the location and continuing the wider search.</thinking>"
                         )
                 message = result.get("data", {}).get("message", "") if result.get("ok") else result.get("error", {}).get(
                     "message", "unknown error"
@@ -453,11 +477,10 @@ async def run_visual_agent(
             @tool
             async def get_battery_status(drone_id: str) -> dict:
                 """Get battery/state information for one drone."""
-                ui.push(
-                    f"<thinking>I need {drone_id}'s battery state before assigning a longer sector or recalling it.</thinking>"
-                )
-                result = _normalize_tool_response(
-                    await tool_map["get_battery_status"].ainvoke({"drone_id": drone_id})
+                result = await _call_tool_with_thinking(
+                    "get_battery_status",
+                    {"drone_id": drone_id},
+                    f"I am checking {drone_id}'s battery before deciding whether to send it farther out or return it to base.",
                 )
                 await _refresh_snapshot(tool_map, snapshot)
                 if result.get("ok"):
@@ -471,10 +494,11 @@ async def run_visual_agent(
             @tool
             async def get_mission_status() -> dict:
                 """Get mission-wide coverage and fleet metrics."""
-                ui.push(
-                    "<thinking>I need mission coverage and fleet status before reallocating sectors or continuing the sweep.</thinking>"
+                result = await _call_tool_with_thinking(
+                    "get_mission_status",
+                    {},
+                    "I am checking mission coverage and fleet status so I can send drones toward unsearched areas and avoid overlap.",
                 )
-                result = _normalize_tool_response(await tool_map["get_mission_status"].ainvoke({}))
                 round_stats["status_calls"] += 1
                 await _refresh_snapshot(tool_map, snapshot)
                 if result.get("ok"):
@@ -495,8 +519,16 @@ async def run_visual_agent(
 
             async def fallback_assign_waypoints() -> int:
                 # Anti-stall fallback: assign strategic waypoints if LLM round produced no movement.
-                fleet_response = _normalize_tool_response(await tool_map["list_drones"].ainvoke({}))
-                mission_response = _normalize_tool_response(await tool_map["get_mission_status"].ainvoke({}))
+                fleet_response = await _call_tool_with_thinking(
+                    "list_drones",
+                    {},
+                    "I am checking the active fleet before the next wave so I only plan with drones that can still fly.",
+                )
+                mission_response = await _call_tool_with_thinking(
+                    "get_mission_status",
+                    {},
+                    "I am checking fresh coverage data so I can push the swarm into areas that have not been searched yet.",
+                )
                 await _refresh_snapshot(tool_map, snapshot)
                 drones = fleet_response.get("data", {}).get("drones", [])
                 mission = mission_response.get("data", {})
@@ -622,8 +654,10 @@ async def run_visual_agent(
                     if not candidates:
                         # No safe exploration target: recall once for recharge if not already at base.
                         if current != base:
-                            move_result = _normalize_tool_response(
-                                await tool_map["move_to"].ainvoke({"drone_id": drone_id, "x": base[0], "y": base[1]})
+                            move_result = await _call_tool_with_thinking(
+                                "move_to",
+                                {"drone_id": drone_id, "x": base[0], "y": base[1]},
+                                f"{drone_id} does not have enough battery for a safe new search target, so I am sending it back to base [0,0] to recharge.",
                             )
                             message = str(move_result.get("data", {}).get("message", "")).lower()
                             accepted = move_result.get("ok") and ("accepted waypoint" in message or "already executing waypoint" in message)
@@ -643,8 +677,10 @@ async def run_visual_agent(
                     target = candidates[0]
                     if previous_target is not None and target == previous_target and len(candidates) > 1:
                         target = candidates[1]
-                    move_result = _normalize_tool_response(
-                        await tool_map["move_to"].ainvoke({"drone_id": drone_id, "x": target[0], "y": target[1]})
+                    move_result = await _call_tool_with_thinking(
+                        "move_to",
+                        {"drone_id": drone_id, "x": target[0], "y": target[1]},
+                        f"I am sending {drone_id} to [{target[0]},{target[1]}] because that area has not been searched yet, the battery reserve is safe, and it keeps the swarm spread out.",
                     )
                     message = str(move_result.get("data", {}).get("message", "")).lower()
                     accepted = move_result.get("ok") and ("accepted waypoint" in message or "already executing waypoint" in message)
@@ -655,14 +691,14 @@ async def run_visual_agent(
                         assignment_lines.append(f"{drone_id}->[{target[0]},{target[1]}]")
                 await _refresh_snapshot(tool_map, snapshot)
                 if assignment_lines:
-                    ui.push("<thinking>Issuing a balanced diagonal wavefront so the swarm expands coverage as one coordinated search shape.</thinking>")
-                    ui.push(f"<thinking>Assigned waypoints: {', '.join(assignment_lines)}</thinking>")
+                    ui.push("<thinking>I am issuing a balanced waypoint wave so the drones cover new ground together instead of overlapping the same cells.</thinking>")
+                    ui.push(f"<thinking>I assigned these drones to new target areas: {', '.join(assignment_lines)}.</thinking>")
                 return len(assignment_lines)
 
             async def wait_until_waypoints_reached(max_wait_sec: float = 120.0) -> None:
                 if not assigned_waypoints:
                     return
-                ui.push("<thinking>Waiting for edge drones to autonomously reach assigned waypoints before the next planning round.</thinking>")
+                ui.push("<thinking>I am waiting for the drones to reach their assigned waypoints before I choose the next set of targets.</thinking>")
                 start = asyncio.get_running_loop().time()
                 last_snapshot: dict[str, tuple[int, int]] = {}
                 stagnant_cycles = 0
@@ -727,6 +763,9 @@ async def run_visual_agent(
                     if offline_tool is None:
                         ui.push("[warn] set_drone_offline MCP tool unavailable; restart bridge after pulling latest code.")
                         break
+                    ui.push(
+                        f"<thinking>I am marking {queued_offline} offline so the swarm can rebalance the search with one fewer drone.</thinking>"
+                    )
                     offline_result = _normalize_tool_response(await offline_tool.ainvoke({"drone_id": queued_offline}))
                     status_msg = offline_result.get("data", {}).get("message", "")
                     ui.push(f"[tool] set_drone_offline({queued_offline}) -> {status_msg or 'ok'}")
@@ -755,7 +794,7 @@ async def run_visual_agent(
                 objective_met = _is_objective_met(active_command, mission_status)
                 if all_survivors_found or full_grid_scanned or objective_met:
                     ui.push(
-                        "<thinking>Mission completion condition met. Edge drones are autonomously returning to base under Mesa completion policy.</thinking>"
+                        "<thinking>The mission objective is complete, so I am ending the search and letting the drones return to base.</thinking>"
                     )
                     ui.push("[agent] MISSION COMPLETE")
                     await _refresh_snapshot(tool_map, snapshot)
@@ -775,10 +814,10 @@ async def run_visual_agent(
                     if now >= next_dispatch_time:
                         assigned_count = await fallback_assign_waypoints()
                         if assigned_count > 0:
-                            ui.push("<thinking>All drones are idle at assigned points. Sending next central waypoint wave now.</thinking>")
+                            ui.push("<thinking>The drones are ready for the next step, so I am sending a new wave toward the next unsearched areas now.</thinking>")
                             next_dispatch_time = now + 0.5
                         else:
-                            ui.push("<thinking>No safe new waypoints available. Holding until recharge/state change before next dispatch attempt.</thinking>")
+                            ui.push("<thinking>I do not have a safe new assignment right now, so I am waiting for recharge or a state change before dispatching again.</thinking>")
                             next_dispatch_time = now + no_assignment_backoff_sec
                 await wait_until_waypoints_reached(max_wait_sec=45.0)
                 await _refresh_snapshot(tool_map, snapshot)

@@ -7,7 +7,7 @@ except Exception:  # pragma: no cover
 
 
 env = SimulationEnvironment()
-mcp = FastMCP("AegisSwarm") if FastMCP else None
+mcp = FastMCP("drone_promax") if FastMCP else None
 
 
 def _ensure_mcp_ready() -> None:
