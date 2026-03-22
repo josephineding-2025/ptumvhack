@@ -34,9 +34,19 @@ class DroneState:
         self.status = DroneStatus.CHARGING if self.is_recall_required(recall_threshold) else DroneStatus.SEARCHING
 
     def to_public_dict(self) -> dict:
+        waypoint = self.metadata.get("waypoint")
+        if isinstance(waypoint, tuple) and len(waypoint) == 2:
+            waypoint_payload: list[int] | None = [int(waypoint[0]), int(waypoint[1])]
+        elif isinstance(waypoint, list) and len(waypoint) == 2:
+            waypoint_payload = [int(waypoint[0]), int(waypoint[1])]
+        else:
+            waypoint_payload = None
+        last_move_tick = self.metadata.get("last_move_tick")
         return {
             "id": self.drone_id,
             "battery": self.battery,
             "location": [self.location[0], self.location[1]],
             "status": self.status.value,
+            "waypoint": waypoint_payload,
+            "last_move_tick": int(last_move_tick) if isinstance(last_move_tick, int) else None,
         }

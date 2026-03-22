@@ -1,4 +1,4 @@
-# Aegis Swarm - Case Study 3 Execution Specification
+# drone promax - Case Study 3 Execution Specification
 
 ## 1. Context and Goal
 

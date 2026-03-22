@@ -32,3 +32,11 @@
 - [ ] Required MCP tool names were used.
 - [ ] At least one low-battery recall occurred.
 - [ ] At least one offline/self-healing reassignment occurred.
+
+## Mission Post-Mortem Table
+| Metric | Value |
+| :--- | :--- |
+| Total Grid Covered (%) | |
+| Survivors Rescued (Count) | |
+| Average Battery Remaining (%) | |
+| Drones Lost in Action (Count) | |

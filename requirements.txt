@@ -6,3 +6,5 @@ fastmcp
 pygame
 openai
 python-dotenv
+mesa
+networkx
